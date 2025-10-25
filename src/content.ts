@@ -817,6 +817,11 @@ function getPageHTML(): string {
   // Clean up excessive whitespace
   html = html.replace(/\s+/g, " ").replace(/>\s+</g, "><").trim();
 
+  // Limit to reasonable size (first 500000 characters)
+  if (html.length > 500000) {
+    html = html.substring(0, 500000) + "\n... (HTMLが長すぎるため省略されました)";
+  }
+
   return html;
 }
 
