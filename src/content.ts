@@ -11,13 +11,13 @@ let kairuEnabled = false;
 // Flag to allow AI operations temporarily
 let isAIOperating = false;
 
-// Conversation history (keep last 30 messages)
+// Conversation history (keep last 1000 messages)
 interface Message {
   role: "user" | "assistant";
   content: string;
 }
 let conversationHistory: Message[] = [];
-const MAX_HISTORY_LENGTH = 30;
+const MAX_HISTORY_LENGTH = 1000;
 
 // Storage keys
 const STORAGE_KEYS = {
@@ -25,6 +25,7 @@ const STORAGE_KEYS = {
   CHAT_HISTORY: "kairu_chat_history",
   ENABLED: "kairu_enabled",
   CONVERSATION: "kairu_conversation",
+  POSITION: "kairu_position",
 };
 
 // Check if extension context is valid
@@ -153,6 +154,12 @@ async function restoreEnabledState() {
       if (container) {
         container.style.display = kairuEnabled ? "block" : "none";
       }
+      // Block/unblock page scroll
+      if (kairuEnabled) {
+        document.body.style.overflow = "hidden";
+      } else {
+        document.body.style.overflow = "";
+      }
       console.log("[Kairu] Enabled state restored successfully:", kairuEnabled);
     } else {
       console.log("[Kairu] No enabled state found in storage");
@@ -160,6 +167,45 @@ async function restoreEnabledState() {
   } catch (error) {
     if (handleContextInvalidation(error)) return;
     console.error("[Kairu] Failed to restore enabled state:", error);
+  }
+}
+
+// Save position to storage
+async function savePosition(bottom: number, right: number) {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.POSITION]: { bottom, right },
+    });
+    console.log("[Kairu] Position saved to storage:", { bottom, right });
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to save position:", error);
+  }
+}
+
+// Restore position from storage
+async function restorePosition() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    const result = await chrome.storage.local.get(STORAGE_KEYS.POSITION);
+    console.log("[Kairu] Restoring position from storage:", result);
+    if (result[STORAGE_KEYS.POSITION]) {
+      const { bottom, right } = result[STORAGE_KEYS.POSITION];
+      const container = document.getElementById(KAIRU_CONTAINER_ID);
+      if (container) {
+        container.style.bottom = `${bottom}px`;
+        container.style.right = `${right}px`;
+      }
+      console.log("[Kairu] Position restored successfully:", { bottom, right });
+    } else {
+      console.log("[Kairu] No position found in storage, using default");
+    }
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to restore position:", error);
   }
 }
 
@@ -228,6 +274,17 @@ function addLog(
   entry.className = `log-entry ${type}`;
   entry.innerHTML = `<span class="log-time">[${time}]</span> ${message}`;
   logContent.appendChild(entry);
+
+  // Keep only last 100 log entries
+  const MAX_LOG_ENTRIES = 100;
+  const entries = logContent.querySelectorAll(".log-entry");
+  if (entries.length > MAX_LOG_ENTRIES) {
+    const entriesToRemove = entries.length - MAX_LOG_ENTRIES;
+    for (let i = 0; i < entriesToRemove; i++) {
+      entries[i].remove();
+    }
+  }
+
   logContent.scrollTop = logContent.scrollHeight;
 
   // Save to storage
@@ -252,6 +309,17 @@ function addRawLog(title: string, content: string) {
   entry.appendChild(contentElement);
 
   logContent.appendChild(entry);
+
+  // Keep only last 100 log entries
+  const MAX_LOG_ENTRIES = 100;
+  const entries = logContent.querySelectorAll(".log-entry");
+  if (entries.length > MAX_LOG_ENTRIES) {
+    const entriesToRemove = entries.length - MAX_LOG_ENTRIES;
+    for (let i = 0; i < entriesToRemove; i++) {
+      entries[i].remove();
+    }
+  }
+
   logContent.scrollTop = logContent.scrollHeight;
 
   // Save to storage
@@ -298,18 +366,18 @@ function addChatMessage(
 // Add system message (status update) - returns the element so it can be updated
 // Show status in the input panel
 function showStatus(message: string) {
-  const statusElement = document.getElementById("kairu-status");
-  if (!statusElement) return;
+  const statusTextElement = document.getElementById("kairu-status-text");
+  if (!statusTextElement) return;
 
-  statusElement.textContent = message;
+  statusTextElement.textContent = message;
 }
 
 // Hide status in the input panel
 function hideStatus() {
-  const statusElement = document.getElementById("kairu-status");
-  if (!statusElement) return;
+  const statusTextElement = document.getElementById("kairu-status-text");
+  if (!statusTextElement) return;
 
-  statusElement.textContent = "";
+  statusTextElement.textContent = "";
 }
 
 // Create Kairu UI
@@ -323,17 +391,20 @@ async function createKairuUI() {
   const container = document.createElement("div");
   container.id = KAIRU_CONTAINER_ID;
   container.innerHTML = `
-    <div id="kairu-character">
-      <div class="kairu-avatar">
-        <div class="kairu-avatar-inner">
-          🐬
+    <button id="kairu-character-wrapper" type="button">
+      <div class="kairu-avatar-shadow"></div>
+      <div id="kairu-character">
+        <div class="kairu-avatar">
+          <div class="kairu-avatar-inner">
+            🐬
+          </div>
         </div>
       </div>
-    </div>
+    </button>
     <div id="kairu-input-panel" style="display: none;">
       <div class="kairu-panel-header">
         <span>Kairuくん</span>
-        <button id="kairu-reset-btn" title="会話をリセット">🔄</button>
+        <button id="kairu-reset-btn" title="会話をリセット">🗑️</button>
       </div>
       <div id="kairu-chat-history"></div>
       <div class="kairu-input-container">
@@ -344,7 +415,9 @@ async function createKairuUI() {
         <summary>実行ログ</summary>
         <div id="kairu-log-content"></div>
       </details>
-      <div id="kairu-status"></div>
+      <div id="kairu-status">
+        <p id="kairu-status-text"></p>
+      </div>
     </div>
   `;
 
@@ -360,21 +433,38 @@ async function createKairuUI() {
       display: none;
     }
 
-    #kairu-character {
+    #kairu-character-wrapper {
       position: relative;
       right: 8px;
       bottom: 8px;
       z-index: 1;
-      cursor: pointer;
+      cursor: grab;
       transition: transform 0.2s;
+      user-select: none;
+      -webkit-user-select: none;
+      -moz-user-select: none;
+      -ms-user-select: none;
+      background: none;
+      border: none;
+      padding: 0;
+      margin: 0;
+      font: inherit;
     }
 
-    #kairu-character:hover {
+    #kairu-character-wrapper:active {
+      cursor: grabbing;
+    }
+
+    #kairu-character-wrapper:hover {
       transform: scale(1.1);
     }
 
     #kairu-character.loading {
       animation: pendulum 1s ease-in-out infinite;
+    }
+
+    #kairu-character.spinning {
+      animation: spin 0.5s ease-in-out;
     }
 
     @keyframes pendulum {
@@ -386,16 +476,39 @@ async function createKairuUI() {
       }
     }
 
+    @keyframes spin {
+      0% {
+        transform: rotate(0deg);
+      }
+      100% {
+        transform: rotate(-360deg);
+      }
+    }
+
+    .kairu-avatar-shadow {
+      position: absolute;
+      width: 60px;
+      height: 60px;
+      border-radius: 50%;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+      pointer-events: none;
+    }
+
     .kairu-avatar {
       width: 60px;
       height: 60px;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      background: linear-gradient(135deg, #43a5f5 0%, #1e88e5 100%);
       border-radius: 50%;
       display: flex;
       align-items: center;
       justify-content: center;
       font-size: 32px;
-      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+      padding: 0px;
+      transition: padding 0.3s ease;
+      position: relative;
+    }
+
+    #kairu-character.loading .kairu-avatar {
       padding: 2px;
     }
 
@@ -428,6 +541,14 @@ async function createKairuUI() {
       display: flex;
       align-items: center;
       height: 86px;
+    }
+
+    #kairu-status-text {
+      margin: 0;
+      padding: 0;
+      color: #666;
+      font-size: 10px;
+      line-height: 1.5;
     }
 
     @keyframes slideUp {
@@ -491,14 +612,14 @@ async function createKairuUI() {
 
     .chat-message.user {
       align-self: flex-end;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      color: white;
+      background: linear-gradient(135deg, #43a5f5 0%, #1e88e5 100%);
+      color: white !important;
     }
 
     .chat-message.assistant {
       align-self: flex-start;
       background: rgba(245, 245, 245, 0.8);
-      color: #333;
+      color: #333 !important;
     }
 
     .chat-message.system {
@@ -538,9 +659,12 @@ async function createKairuUI() {
     }
 
     #kairu-submit-btn {
+      display: flex;
+      align-items: center;
+      justify-content: center;
       width: 100%;
       padding: 10px;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      background: linear-gradient(135deg, #43a5f5 0%, #1e88e5 100%);
       color: white;
       border: none;
       border-radius: 8px;
@@ -632,13 +756,15 @@ async function createKairuUI() {
   document.head.appendChild(style);
   document.body.appendChild(container);
 
-  // Restore logs, chat history, conversation, and enabled state from storage
+  // Restore logs, chat history, conversation, position, and enabled state from storage
   await restoreLogs();
   await restoreChatHistory();
   await restoreConversation();
+  await restorePosition();
   await restoreEnabledState();
 
   // Add event listeners
+  const characterWrapper = document.getElementById("kairu-character-wrapper")!;
   const character = document.getElementById("kairu-character")!;
   const inputPanel = document.getElementById("kairu-input-panel")!;
   const input = document.getElementById(KAIRU_INPUT_ID) as HTMLTextAreaElement;
@@ -651,7 +777,7 @@ async function createKairuUI() {
 
   // Reset button click
   resetBtn.addEventListener("click", () => {
-    if (confirm("会話履歴をリセットしますか？")) {
+    if (confirm("会話履歴と実行ログをリセットしますか？")) {
       // Clear conversation history
       clearConversation();
 
@@ -662,29 +788,125 @@ async function createKairuUI() {
         saveChatHistory(); // Save empty state
       }
 
-      addLog("会話履歴をリセットしました", "info");
+      // Clear execution log
+      clearLog();
+      addLog("会話履歴と実行ログをリセットしました", "info");
     }
   });
 
-  // Show input panel on hover
-  character.addEventListener("mouseenter", () => {
-    inputPanel.style.display = "block";
-    // Scroll chat history to bottom when panel is shown
-    const chatHistory = document.getElementById("kairu-chat-history");
-    if (chatHistory) {
-      chatHistory.scrollTop = chatHistory.scrollHeight;
+  // Toggle input panel on click (will be triggered by mouseup if not dragging)
+  const togglePanel = () => {
+    // Toggle panel visibility
+    const isVisible = inputPanel.style.display === "block";
+    inputPanel.style.display = isVisible ? "none" : "block";
+
+    // Add spinning animation to inner character
+    character.classList.add("spinning");
+    setTimeout(() => {
+      character.classList.remove("spinning");
+    }, 500);
+
+    // Scroll chat history to bottom when panel is opened
+    if (!isVisible) {
+      const chatHistory = document.getElementById("kairu-chat-history");
+      if (chatHistory) {
+        chatHistory.scrollTop = chatHistory.scrollHeight;
+      }
+    }
+  };
+
+  // Toggle panel with Command + K (or Ctrl + K on Windows/Linux)
+  document.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+      e.preventDefault();
+
+      togglePanel();
+
+      // Focus on input when opening
+      const isVisible = inputPanel.style.display === "block";
+      if (isVisible) {
+        input.focus();
+      }
     }
   });
 
-  // Keep panel open when hovering over it
-  container.addEventListener("mouseleave", () => {
-    inputPanel.style.display = "none";
+  // Drag and drop functionality
+  let isDragging = false;
+  let dragStartX = 0;
+  let dragStartY = 0;
+  let initialBottom = 0;
+  let initialRight = 0;
+
+  characterWrapper.addEventListener("mousedown", (e) => {
+    // Only start drag if not clicking to toggle
+    if (e.button !== 0) return; // Only left mouse button
+
+    isDragging = true;
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+
+    // Get current position
+    const containerRect = container.getBoundingClientRect();
+    initialBottom = window.innerHeight - containerRect.bottom;
+    initialRight = window.innerWidth - containerRect.right;
+
+    e.preventDefault();
+  });
+
+  document.addEventListener("mousemove", (e) => {
+    if (!isDragging) return;
+
+    const deltaX = e.clientX - dragStartX;
+    const deltaY = e.clientY - dragStartY;
+
+    // Get container dimensions
+    const containerRect = container.getBoundingClientRect();
+    const containerWidth = containerRect.width;
+    const containerHeight = containerRect.height;
+
+    // Calculate new position (invert Y because bottom increases downward)
+    let newBottom = initialBottom - deltaY;
+    let newRight = initialRight - deltaX;
+
+    // Apply boundaries
+    // Bottom: minimum 0, maximum (window height - container height)
+    newBottom = Math.max(0, Math.min(newBottom, window.innerHeight - containerHeight));
+    // Right: minimum 0, maximum (window width - container width)
+    newRight = Math.max(0, Math.min(newRight, window.innerWidth - containerWidth));
+
+    container.style.bottom = `${newBottom}px`;
+    container.style.right = `${newRight}px`;
+  });
+
+  document.addEventListener("mouseup", (e) => {
+    if (isDragging) {
+      isDragging = false;
+
+      // Save position to storage
+      const containerRect = container.getBoundingClientRect();
+      const bottom = window.innerHeight - containerRect.bottom;
+      const right = window.innerWidth - containerRect.right;
+      savePosition(bottom, right);
+
+      // Check if it was a click (no significant movement)
+      const deltaX = Math.abs(e.clientX - dragStartX);
+      const deltaY = Math.abs(e.clientY - dragStartY);
+      const wasClick = deltaX < 5 && deltaY < 5;
+
+      // If it was a click, trigger the toggle
+      if (wasClick) {
+        togglePanel();
+      }
+    }
   });
 
   // Submit button click
   submitBtn.addEventListener("click", async () => {
     const userInput = input.value.trim();
     if (!userInput) return;
+
+    // Clear input immediately
+    input.value = "";
 
     submitBtn.disabled = true;
     submitBtn.textContent = "送信中...";
@@ -732,7 +954,7 @@ async function createKairuUI() {
         content: userInput,
       });
 
-      // Keep only last 30 messages
+      // Keep only last 1000 messages
       if (conversationHistory.length > MAX_HISTORY_LENGTH) {
         conversationHistory = conversationHistory.slice(-MAX_HISTORY_LENGTH);
       }
@@ -748,7 +970,7 @@ async function createKairuUI() {
         content: aiResponse,
       });
 
-      // Keep only last 30 messages
+      // Keep only last 1000 messages
       if (conversationHistory.length > MAX_HISTORY_LENGTH) {
         conversationHistory = conversationHistory.slice(-MAX_HISTORY_LENGTH);
       }
@@ -758,9 +980,13 @@ async function createKairuUI() {
 
       // Parse response and execute actions
       await processAIResponse(aiResponse);
-      input.value = "";
     } catch (error) {
       console.error("Error:", error);
+
+      // Restore input if empty (error occurred)
+      if (!input.value.trim()) {
+        input.value = userInput;
+      }
 
       // Handle context invalidation error
       if (handleContextInvalidation(error)) {
@@ -817,9 +1043,10 @@ function getPageHTML(): string {
   // Clean up excessive whitespace
   html = html.replace(/\s+/g, " ").replace(/>\s+</g, "><").trim();
 
-  // Limit to reasonable size (first 500000 characters)
-  if (html.length > 500000) {
-    html = html.substring(0, 500000) + "\n... (HTMLが長すぎるため省略されました)";
+  // Limit to reasonable size (first 300000 characters)
+  if (html.length > 300000) {
+    html =
+      html.substring(0, 300000) + "\n... (HTMLが長すぎるため省略されました)";
   }
 
   return html;
@@ -966,7 +1193,9 @@ ${pageHTML}
 2. type: フォームに入力 (selectorで要素を指定、valueで入力値を指定)
 3. navigate: ページ遷移 (urlで指定)
 4. scroll: スクロール (directionで"up"か"down"を指定)
-5. get_info: ページ情報を取得 (typeで"title", "url", "text"を指定)
+5. back: ブラウザの戻るボタンを押す \`{"action": "back"}\`
+6. forward: ブラウザの進むボタンを押す \`{"action": "forward"}\`
+7. get_info: ページ情報を取得 (typeで"title", "url", "text"を指定)
 
 応答形式 (必ずJSON):
 {
@@ -990,7 +1219,7 @@ ${pageHTML}
       role: "system",
       content: systemPrompt,
     },
-    // Add conversation history (last 30 messages)
+    // Add conversation history (last 1000 messages)
     ...conversationHistory,
     // Add current user message with page context
     {
@@ -1099,6 +1328,14 @@ async function executeAction(action: any): Promise<void> {
       case "scroll":
         scrollPage(action.direction);
         break;
+      case "back":
+        addLog("ブラウザで戻る操作を実行", "info");
+        window.history.back();
+        break;
+      case "forward":
+        addLog("ブラウザで進む操作を実行", "info");
+        window.history.forward();
+        break;
       case "get_info":
         const info = getPageInfo(action.type);
         console.log("Page info:", info);
@@ -1146,7 +1383,10 @@ async function clickElement(selector?: string, text?: string): Promise<void> {
     );
     console.log("Clicked element:", element);
   } else {
-    const errorMsg = `要素が見つかりませんでした (selector: ${selector}, text: ${text})`;
+    const searchCriteria = selector
+      ? `selector: ${selector}${text ? `, text: ${text}` : ""}`
+      : `text: ${text}`;
+    const errorMsg = `要素が見つかりませんでした (${searchCriteria})`;
     addLog(errorMsg, "error");
     throw new Error(errorMsg);
   }
@@ -1213,6 +1453,13 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
     const container = document.getElementById(KAIRU_CONTAINER_ID);
     if (container) {
       container.style.display = kairuEnabled ? "block" : "none";
+    }
+
+    // Block/unblock page scroll
+    if (kairuEnabled) {
+      document.body.style.overflow = "hidden";
+    } else {
+      document.body.style.overflow = "";
     }
 
     // Save enabled state to storage
