@@ -682,6 +682,11 @@ async function createKairuUI() {
       opacity: 0.8;
     }
 
+    #kairu-submit-btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
     #kairu-debug-log {
       margin-top: 12px;
       border: 1px solid #ddd;
@@ -902,6 +907,11 @@ async function createKairuUI() {
 
   // Submit button click
   submitBtn.addEventListener("click", async () => {
+    // Prevent submit if already disabled
+    if (submitBtn.disabled) {
+      return;
+    }
+
     const userInput = input.value.trim();
     if (!userInput) return;
 
@@ -1043,10 +1053,10 @@ function getPageHTML(): string {
   // Clean up excessive whitespace
   html = html.replace(/\s+/g, " ").replace(/>\s+</g, "><").trim();
 
-  // Limit to reasonable size (first 300000 characters)
-  if (html.length > 300000) {
+  // Limit to reasonable size (first 250000 characters)
+  if (html.length > 250000) {
     html =
-      html.substring(0, 300000) + "\n... (HTMLが長すぎるため省略されました)";
+      html.substring(0, 250000) + "\n... (HTMLが長すぎるため省略されました)";
   }
 
   return html;
@@ -1253,6 +1263,33 @@ ${pageHTML}
     hideStatus();
     const errorText = await response.text();
     addLog(`APIエラー詳細: ${errorText}`, "error");
+
+    // Parse error response
+    try {
+      const errorData = JSON.parse(errorText);
+      if (errorData.error) {
+        const error = errorData.error;
+
+        // Handle rate limit error
+        if (error.code === "rate_limit_exceeded") {
+          const message = "⏱️ APIのレート制限に達しました。少し時間をおいてから再度お試しください。";
+          addChatMessage(message, "assistant");
+          throw new Error(message);
+        }
+
+        // Handle other API errors
+        const message = `❌ APIエラー: ${error.message || errorText}`;
+        addChatMessage(message, "assistant");
+        throw new Error(message);
+      }
+    } catch (parseError) {
+      // If error response is not JSON, use the raw text
+      if (parseError instanceof SyntaxError) {
+        throw new Error(`API request failed: ${response.status} - ${errorText}`);
+      }
+      throw parseError;
+    }
+
     throw new Error(`API request failed: ${response.status} - ${errorText}`);
   }
 

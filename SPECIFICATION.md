@@ -35,7 +35,7 @@ Kairu AI for Chrome Extensionは、OpenAI APIを使用してブラウザ操作�
   - ヘッダー: "Kairuくん" + ゴミ箱アイコン（会話履歴リセット）
   - チャット履歴表示エリア
   - テキスト入力欄
-  - 送信ボタン
+  - 送信ボタン（送信中は無効化）
   - 実行ログ（折りたたみ可能）
   - ステータス表示エリア
 
@@ -172,6 +172,7 @@ Kairu AI for Chrome Extensionは、OpenAI APIを使用してブラウザ操作�
 #### カーソル
 - **通常**: `grab`
 - **ドラッグ中**: `grabbing`
+- **送信ボタン無効時**: `not-allowed`
 
 ### 10. キーボードショートカット
 
