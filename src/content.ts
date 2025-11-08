@@ -59,6 +59,7 @@ const STORAGE_KEYS = {
   LAST_QUIZ_COUNT: "kairu_last_quiz_count",
   VISITED_SITES: "kairu_visited_sites",
   QUIZ_STATE: "kairu_quiz_state",
+  WINDOW_OPEN: "kairu_window_open",
 };
 
 // Check if extension context is valid
@@ -239,6 +240,33 @@ async function restorePosition() {
   } catch (error) {
     if (handleContextInvalidation(error)) return;
     console.error("[Kairu] Failed to restore position:", error);
+  }
+}
+
+// Restore window open/close state from storage
+async function restoreWindowState() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    const result = await chrome.storage.local.get(STORAGE_KEYS.WINDOW_OPEN);
+    console.log("[Kairu] Restoring window state from storage:", result);
+    const inputPanel = document.getElementById("kairu-input-panel");
+    if (inputPanel) {
+      const isOpen = result[STORAGE_KEYS.WINDOW_OPEN] === true;
+      inputPanel.style.display = isOpen ? "block" : "none";
+      console.log("[Kairu] Window state restored successfully:", isOpen ? "open" : "closed");
+
+      // Scroll chat history to bottom if window is open
+      if (isOpen) {
+        const chatHistory = document.getElementById("kairu-chat-history");
+        if (chatHistory) {
+          chatHistory.scrollTop = chatHistory.scrollHeight;
+        }
+      }
+    }
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to restore window state:", error);
   }
 }
 
@@ -1170,6 +1198,7 @@ async function createKairuUI() {
   await restoreChatHistory();
   await restoreConversation();
   await restorePosition();
+  await restoreWindowState();
   await restoreEnabledState();
   await restoreMessageCount();
   await restoreLastQuizCount();
@@ -1234,7 +1263,13 @@ async function createKairuUI() {
   const togglePanel = () => {
     // Toggle panel visibility
     const isVisible = inputPanel.style.display === "block";
-    inputPanel.style.display = isVisible ? "none" : "block";
+    const newVisibility = !isVisible;
+    inputPanel.style.display = newVisibility ? "block" : "none";
+
+    // Save window state to storage
+    if (isExtensionContextValid()) {
+      chrome.storage.local.set({ [STORAGE_KEYS.WINDOW_OPEN]: newVisibility });
+    }
 
     // Add spinning animation to inner character
     character.classList.add("spinning");
@@ -1243,7 +1278,7 @@ async function createKairuUI() {
     }, 500);
 
     // Scroll chat history to bottom when panel is opened
-    if (!isVisible) {
+    if (newVisibility) {
       const chatHistory = document.getElementById("kairu-chat-history");
       if (chatHistory) {
         chatHistory.scrollTop = chatHistory.scrollHeight;
