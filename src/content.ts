@@ -19,6 +19,35 @@ interface Message {
 let conversationHistory: Message[] = [];
 const MAX_HISTORY_LENGTH = 1000;
 
+// Quiz-related state
+interface VisitedSite {
+  url: string;
+  title: string;
+  visitedAt: number;
+  content: string; // Summary of page content
+}
+
+interface QuizState {
+  isQuizMode: boolean;
+  currentQuiz: {
+    question: string;
+    options: string[]; // 4 choices
+    correctAnswer: number; // Index of correct answer (0-3)
+  } | null;
+  attempts: number;
+}
+
+let messageCount = 0; // Count of user-assistant message pairs
+let lastQuizCount = 0; // Message count when last quiz was given
+let visitedSites: VisitedSite[] = [];
+let quizState: QuizState = {
+  isQuizMode: false,
+  currentQuiz: null,
+  attempts: 0,
+};
+const MAX_VISITED_SITES = 50; // Keep track of last 50 sites
+const QUIZ_INTERVAL = 5; // Quiz every 5 message pairs
+
 // Storage keys
 const STORAGE_KEYS = {
   LOGS: "kairu_logs",
@@ -26,6 +55,10 @@ const STORAGE_KEYS = {
   ENABLED: "kairu_enabled",
   CONVERSATION: "kairu_conversation",
   POSITION: "kairu_position",
+  MESSAGE_COUNT: "kairu_message_count",
+  LAST_QUIZ_COUNT: "kairu_last_quiz_count",
+  VISITED_SITES: "kairu_visited_sites",
+  QUIZ_STATE: "kairu_quiz_state",
 };
 
 // Check if extension context is valid
@@ -261,6 +294,369 @@ function clearConversation() {
   }
 }
 
+// Save message count to storage
+async function saveMessageCount() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    await chrome.storage.local.set({ [STORAGE_KEYS.MESSAGE_COUNT]: messageCount });
+    console.log("[Kairu] Message count saved to storage:", messageCount);
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to save message count:", error);
+  }
+}
+
+// Restore message count from storage
+async function restoreMessageCount() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    const result = await chrome.storage.local.get(STORAGE_KEYS.MESSAGE_COUNT);
+    if (result[STORAGE_KEYS.MESSAGE_COUNT] !== undefined) {
+      messageCount = result[STORAGE_KEYS.MESSAGE_COUNT];
+      console.log("[Kairu] Message count restored:", messageCount);
+    }
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to restore message count:", error);
+  }
+}
+
+// Save last quiz count to storage
+async function saveLastQuizCount() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    await chrome.storage.local.set({ [STORAGE_KEYS.LAST_QUIZ_COUNT]: lastQuizCount });
+    console.log("[Kairu] Last quiz count saved to storage:", lastQuizCount);
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to save last quiz count:", error);
+  }
+}
+
+// Restore last quiz count from storage
+async function restoreLastQuizCount() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    const result = await chrome.storage.local.get(STORAGE_KEYS.LAST_QUIZ_COUNT);
+    if (result[STORAGE_KEYS.LAST_QUIZ_COUNT] !== undefined) {
+      lastQuizCount = result[STORAGE_KEYS.LAST_QUIZ_COUNT];
+      console.log("[Kairu] Last quiz count restored:", lastQuizCount);
+    }
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to restore last quiz count:", error);
+  }
+}
+
+// Save visited sites to storage
+async function saveVisitedSites() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    await chrome.storage.local.set({ [STORAGE_KEYS.VISITED_SITES]: visitedSites });
+    console.log("[Kairu] Visited sites saved to storage:", visitedSites.length);
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to save visited sites:", error);
+  }
+}
+
+// Restore visited sites from storage
+async function restoreVisitedSites() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    const result = await chrome.storage.local.get(STORAGE_KEYS.VISITED_SITES);
+    if (result[STORAGE_KEYS.VISITED_SITES]) {
+      visitedSites = result[STORAGE_KEYS.VISITED_SITES];
+      console.log("[Kairu] Visited sites restored:", visitedSites.length);
+    }
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to restore visited sites:", error);
+  }
+}
+
+// Save quiz state to storage
+async function saveQuizState() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    await chrome.storage.local.set({ [STORAGE_KEYS.QUIZ_STATE]: quizState });
+    console.log("[Kairu] Quiz state saved to storage");
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to save quiz state:", error);
+  }
+}
+
+// Restore quiz state from storage
+async function restoreQuizState() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    const result = await chrome.storage.local.get(STORAGE_KEYS.QUIZ_STATE);
+    if (result[STORAGE_KEYS.QUIZ_STATE]) {
+      quizState = result[STORAGE_KEYS.QUIZ_STATE];
+      console.log("[Kairu] Quiz state restored");
+    }
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to restore quiz state:", error);
+  }
+}
+
+// Record current site visit
+async function recordSiteVisit() {
+  const currentUrl = window.location.href;
+  const currentTitle = document.title;
+
+  // Get page content summary (first 500 characters of visible text)
+  const pageText = document.body.innerText.substring(0, 500);
+
+  // Check if this URL is already in the list (update if exists)
+  const existingIndex = visitedSites.findIndex(site => site.url === currentUrl);
+
+  const siteInfo: VisitedSite = {
+    url: currentUrl,
+    title: currentTitle,
+    visitedAt: Date.now(),
+    content: pageText,
+  };
+
+  if (existingIndex >= 0) {
+    // Update existing entry
+    visitedSites[existingIndex] = siteInfo;
+  } else {
+    // Add new entry
+    visitedSites.push(siteInfo);
+
+    // Keep only last MAX_VISITED_SITES
+    if (visitedSites.length > MAX_VISITED_SITES) {
+      visitedSites = visitedSites.slice(-MAX_VISITED_SITES);
+    }
+  }
+
+  await saveVisitedSites();
+  console.log("[Kairu] Recorded site visit:", currentTitle);
+}
+
+// Check if it's time to show a quiz
+function shouldShowQuiz(): boolean {
+  // Don't show quiz if already in quiz mode
+  if (quizState.isQuizMode) {
+    return false;
+  }
+
+  // Need at least 2 visited sites to create a quiz
+  if (visitedSites.length < 2) {
+    return false;
+  }
+
+  // Check if enough messages have passed since last quiz
+  const messagesSinceLastQuiz = messageCount - lastQuizCount;
+  return messagesSinceLastQuiz >= QUIZ_INTERVAL;
+}
+
+// Generate quiz using OpenAI API
+async function generateQuiz(apiKey: string): Promise<{ question: string; options: string[]; correctAnswer: number }> {
+  // Select a random visited site (not the current one)
+  const currentUrl = window.location.href;
+  const eligibleSites = visitedSites.filter(site => site.url !== currentUrl);
+
+  if (eligibleSites.length === 0) {
+    // Fallback to all sites if current URL doesn't match
+    eligibleSites.push(...visitedSites);
+  }
+
+  const randomSite = eligibleSites[Math.floor(Math.random() * eligibleSites.length)];
+
+  const quizPrompt = `以下のサイト情報を基に、ユーザーが過去に訪問したサイトの内容を理解しているか確認するための4択クイズを1つ作成してください。
+
+サイト情報:
+- タイトル: ${randomSite.title}
+- URL: ${randomSite.url}
+- 内容の一部: ${randomSite.content}
+
+クイズの条件:
+1. 質問文には必ずサイトのタイトル（「${randomSite.title}」）を含めること
+2. 「このサイト」という表現は使わず、具体的なサイト名を使うこと
+3. 「先ほど見た〜」「以前訪問した〜」などの表現を使って、過去のサイトであることを明示すること
+4. サイトの主なテーマや内容に関する質問にする
+5. 4つの選択肢を用意する（1つが正解、3つが不正解）
+6. 不正解の選択肢は、もっともらしいが明らかに違うものにする
+7. 正解の選択肢のインデックス（0-3）も返す
+
+質問文の例:
+- 「先ほど見た「${randomSite.title}」の主なテーマは何でしたか？」
+- 「以前訪問した「${randomSite.title}」で紹介されていた内容は何ですか？」
+
+以下のJSON形式で応答してください：
+{
+  "question": "質問文",
+  "options": ["選択肢1", "選択肢2", "選択肢3", "選択肢4"],
+  "correctAnswer": 0
+}`;
+
+  // Log the quiz generation prompt
+  addLog("クイズ生成プロンプトを送信中...", "info");
+  addRawLog("クイズ生成プロンプト", quizPrompt);
+
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-5-nano",
+      messages: [
+        {
+          role: "system",
+          content: "あなたはクイズを作成するアシスタントです。ユーザーが訪問したサイトの内容を理解しているか確認する4択クイズを作成します。",
+        },
+        {
+          role: "user",
+          content: quizPrompt,
+        },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Quiz generation failed: ${response.status}`);
+  }
+
+  const data = await response.json();
+  const aiResponseContent = data.choices[0].message.content;
+
+  // Log the quiz generation response
+  addLog("クイズ生成完了", "success");
+  addRawLog("クイズ生成レスポンス", aiResponseContent);
+
+  const quizData = JSON.parse(aiResponseContent);
+
+  return {
+    question: quizData.question,
+    options: quizData.options,
+    correctAnswer: quizData.correctAnswer,
+  };
+}
+
+// Start quiz mode
+async function startQuizMode(apiKey: string): Promise<void> {
+  addLog("クイズモードを開始します", "info");
+
+  try {
+    // Generate quiz
+    const quiz = await generateQuiz(apiKey);
+
+    // Set quiz state
+    quizState.isQuizMode = true;
+    quizState.currentQuiz = quiz;
+    quizState.attempts = 0;
+
+    addLog("クイズ状態を更新: isQuizMode = true", "success");
+
+    await saveQuizState();
+
+    // Update last quiz count
+    lastQuizCount = messageCount;
+    await saveLastQuizCount();
+
+    // Format quiz message with options (with better spacing)
+    const optionsText = quiz.options
+      .map((option, index) => `${index + 1}. ${option}`)
+      .join("\n\n");
+
+    const quizMessage = `🎯 クイズタイム！\n\n${quiz.question}\n\n${optionsText}\n\n答えの番号（1-4）を入力してください。`;
+
+    // Show quiz to user (use "assistant" role for normal chat appearance)
+    addChatMessage(quizMessage, "assistant");
+    addLog("クイズを出題しました", "success");
+  } catch (error) {
+    addLog(`クイズ生成エラー: ${(error as Error).message}`, "error");
+    console.error("Quiz generation error:", error);
+  }
+}
+
+// Check quiz answer
+async function checkQuizAnswer(userAnswer: string): Promise<boolean> {
+  addLog("クイズ回答チェック開始", "info");
+
+  if (!quizState.currentQuiz) {
+    addLog("エラー: クイズが存在しません", "error");
+    // Force exit quiz mode if no quiz exists
+    quizState.isQuizMode = false;
+    await saveQuizState();
+    return false;
+  }
+
+  quizState.attempts++;
+  await saveQuizState();
+
+  // Parse user answer (expecting 1-4)
+  const answerNum = parseInt(userAnswer.trim());
+
+  // Check if valid number
+  if (isNaN(answerNum) || answerNum < 1 || answerNum > 4) {
+    addChatMessage("❌ 1から4の数字で答えてください。", "assistant");
+    addLog("無効な回答形式", "warning");
+    quizState.attempts--; // Don't count this as an attempt
+    await saveQuizState();
+    return false;
+  }
+
+  // Convert to 0-indexed
+  const selectedIndex = answerNum - 1;
+
+  // Check if answer is correct
+  const isCorrect = selectedIndex === quizState.currentQuiz.correctAnswer;
+
+  if (isCorrect) {
+    // Correct answer
+    const correctOption = quizState.currentQuiz.options[quizState.currentQuiz.correctAnswer];
+    addChatMessage(`🎉 正解です！素晴らしい！\n\n答え: ${correctOption}`, "assistant");
+    addLog("クイズに正解しました", "success");
+
+    // Exit quiz mode
+    quizState.isQuizMode = false;
+    quizState.currentQuiz = null;
+    quizState.attempts = 0;
+    await saveQuizState();
+    addLog("クイズモードを終了しました", "success");
+
+    return true;
+  } else {
+    // Incorrect answer
+    const maxAttempts = 3; // Allow 3 attempts
+
+    if (quizState.attempts < maxAttempts) {
+      // Allow retry
+      addChatMessage(`❌ 残念、違います。\n\nあと${maxAttempts - quizState.attempts}回挑戦できます。もう一度考えてみてください！`, "assistant");
+      addLog(`クイズ不正解（試行${quizState.attempts}回目）`, "warning");
+    } else {
+      // No more attempts, show answer
+      const correctOption = quizState.currentQuiz.options[quizState.currentQuiz.correctAnswer];
+      addChatMessage(`❌ 残念、違います。\n\n正解は「${quizState.currentQuiz.correctAnswer + 1}. ${correctOption}」でした。\n\n次は頑張ってくださいね！`, "assistant");
+      addLog("クイズ不正解、正解を表示", "warning");
+
+      // Exit quiz mode
+      quizState.isQuizMode = false;
+      quizState.currentQuiz = null;
+      quizState.attempts = 0;
+      await saveQuizState();
+      addLog("クイズモードを終了しました", "success");
+    }
+
+    return false;
+  }
+}
+
 // Logger
 function addLog(
   message: string,
@@ -431,6 +827,11 @@ async function createKairuUI() {
       z-index: 2147483647;
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
       display: none;
+      color-scheme: light !important;
+    }
+
+    #${KAIRU_CONTAINER_ID} * {
+      color-scheme: light !important;
     }
 
     #kairu-character-wrapper {
@@ -608,6 +1009,7 @@ async function createKairuUI() {
       font-size: 13px;
       line-height: 1.4;
       word-wrap: break-word;
+      white-space: pre-wrap;
     }
 
     .chat-message.user {
@@ -650,12 +1052,14 @@ async function createKairuUI() {
       background: rgba(255, 255, 255, 0.5);
       backdrop-filter: blur(10px);
       -webkit-backdrop-filter: blur(10px);
+      color: #333 !important;
     }
 
     #${KAIRU_INPUT_ID}:focus {
       outline: none;
       border-color: #667eea;
       background: rgba(255, 255, 255, 0.7);
+      color: #333 !important;
     }
 
     #kairu-submit-btn {
@@ -767,6 +1171,13 @@ async function createKairuUI() {
   await restoreConversation();
   await restorePosition();
   await restoreEnabledState();
+  await restoreMessageCount();
+  await restoreLastQuizCount();
+  await restoreVisitedSites();
+  await restoreQuizState();
+
+  // Record initial site visit
+  await recordSiteVisit();
 
   // Add event listeners
   const characterWrapper = document.getElementById("kairu-character-wrapper")!;
@@ -781,8 +1192,10 @@ async function createKairuUI() {
   ) as HTMLButtonElement;
 
   // Reset button click
-  resetBtn.addEventListener("click", () => {
+  resetBtn.addEventListener("click", async () => {
     if (confirm("会話履歴と実行ログをリセットしますか？")) {
+      console.log("[Kairu] リセット開始");
+
       // Clear conversation history
       clearConversation();
 
@@ -795,7 +1208,25 @@ async function createKairuUI() {
 
       // Clear execution log
       clearLog();
+
+      // Reset quiz-related state
+      messageCount = 0;
+      lastQuizCount = 0;
+      quizState = {
+        isQuizMode: false,
+        currentQuiz: null,
+        attempts: 0,
+      };
+
+      console.log("[Kairu] クイズ状態をリセット:", quizState);
+
+      // Save cleared state
+      await saveMessageCount();
+      await saveLastQuizCount();
+      await saveQuizState();
+
       addLog("会話履歴と実行ログをリセットしました", "info");
+      addLog(`クイズモード状態: ${quizState.isQuizMode}`, "success");
     }
   });
 
@@ -958,6 +1389,19 @@ async function createKairuUI() {
         return;
       }
 
+      // Check if in quiz mode
+      addLog(`現在のクイズモード状態: ${quizState.isQuizMode}`, "info");
+
+      if (quizState.isQuizMode) {
+        // In quiz mode: only accept quiz answers (1-4)
+        addLog("クイズモード中です", "info");
+        await checkQuizAnswer(userInput);
+        return;
+      }
+
+      // Record site visit before processing
+      await recordSiteVisit();
+
       // Add user message to conversation history
       conversationHistory.push({
         role: "user",
@@ -985,11 +1429,31 @@ async function createKairuUI() {
         conversationHistory = conversationHistory.slice(-MAX_HISTORY_LENGTH);
       }
 
+      // Increment message count (one exchange = user + assistant)
+      messageCount++;
+      await saveMessageCount();
+
       // Save conversation to storage
       saveConversation();
 
       // Parse response and execute actions
       await processAIResponse(aiResponse);
+
+      // Check if it's time to show a quiz
+      addLog(`クイズ判定: メッセージ数=${messageCount}, 前回クイズ=${lastQuizCount}, 訪問サイト数=${visitedSites.length}, クイズモード=${quizState.isQuizMode}`, "info");
+
+      if (shouldShowQuiz()) {
+        addLog("クイズ出題条件を満たしました", "success");
+        // Wait a bit before showing quiz
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+
+        // Update button state for quiz generation (keep disabled but change text)
+        submitBtn.textContent = "送信";
+
+        await startQuizMode(apiKey);
+      } else {
+        addLog("クイズ出題条件を満たしていません", "warning");
+      }
     } catch (error) {
       console.error("Error:", error);
 
@@ -1162,15 +1626,30 @@ ${pageHTML}
 
   const systemPrompt = `あなたはKairuというブラウザ操作アシスタントです。ユーザーの指示に従ってブラウザを操作します。
 
-## 重要な指示
+## 🚨 最重要ルール：インタラクティブ要素リストを必ず使用すること
 
-1. **インタラクティブ要素リストを優先的に参照する**
-   - まず「インタラクティブ要素」セクションを確認してください
-   - このリストには、クリック可能なボタンや入力欄が番号付きで整理されています
-   - 操作対象の要素を特定する際は、このリストを最優先で使用してください
-   - リストに記載されている要素の属性（id, name, type等）を使ってセレクタを作成してください
+**要素をクリックする際の手順（必須）:**
+1. まず「インタラクティブ要素」セクションで該当する要素を探す
+2. 要素が見つかった場合は、そのid, name, classなどの属性を使ってselectorを作成する
+3. **textパラメータは最後の手段**: インタラクティブ要素リストに該当する要素が無い場合のみ使用
 
-2. **正確なセレクタの作成 - 絶対に守るべきルール**
+**具体例（Googleの検索ボタン）:**
+インタラクティブ要素リストに以下のような要素がある場合:
+
+  1. <button name="btnK" class="gNO89b"> "Google 検索"
+
+❌ 間違い: {"action": "click", "text": "検索"}
+✅ 正解: {"action": "click", "selector": "button[name='btnK']"}
+✅ 正解: {"action": "click", "selector": ".gNO89b"}
+
+**なぜselectorを優先するか:**
+- textパラメータは曖昧で、意図しない要素をクリックする可能性がある
+- selectorは正確で確実
+- インタラクティブ要素リストに記載されている要素は確実に存在する
+
+## その他の重要な指示
+
+1. **正確なセレクタの作成 - 絶対に守るべきルール**
    - **禁止**: \`[href*="店名"]\` や \`[href*="ボタンのテキスト"]\` のようなセレクタは絶対に使用禁止
    - **理由**: href属性にはURL（例: "/tokyo/rstdtl/..."）が入っており、テキスト内容は含まれていません
    - **正しい方法**: リンクやボタンのテキスト内容でクリックする場合は、必ず\`text\`パラメータを使用してください
@@ -1199,6 +1678,14 @@ ${pageHTML}
 1. click: 要素をクリック
    - selectorで指定: \`{"action": "click", "selector": "button.submit-btn"}\`
    - textで指定: \`{"action": "click", "text": "ログイン"}\`
+   - **リンクをクリックする場合の重要なルール:**
+     - リンクのテキストの一部だけでもマッチします（部分一致OK）
+     - 大文字小文字は区別されません
+     - リンクのテキストが長い場合、キーワードだけを指定してもOK
+     - 例: リンクが「Claude Code Documentation - Getting Started」の場合
+       - ✅ \`{"action": "click", "text": "Documentation"}\` ← これでOK
+       - ✅ \`{"action": "click", "text": "getting started"}\` ← 小文字でもOK
+       - ✅ \`{"action": "click", "text": "claude code"}\` ← 部分一致でOK
    - 推奨: テキストが表示されている要素は、textパラメータを使用する方が確実です
 2. type: フォームに入力 (selectorで要素を指定、valueで入力値を指定)
 3. navigate: ページ遷移 (urlで指定)
@@ -1400,12 +1887,49 @@ async function clickElement(selector?: string, text?: string): Promise<void> {
 
   if (!element && text) {
     addLog(`テキストで要素を検索: ${text}`, "info");
-    // Search by text content
-    const allElements = document.querySelectorAll("button, a, [role='button']");
+
+    // Normalize search text (lowercase, trim)
+    const normalizedText = text.toLowerCase().trim();
+
+    // Search by text content (prioritize links)
+    const allElements = document.querySelectorAll("a, button, [role='button']");
+
+    // Try exact match first
     for (const el of Array.from(allElements)) {
-      if (el.textContent?.trim().includes(text)) {
+      const elementText = el.textContent?.toLowerCase().trim() || "";
+      if (elementText === normalizedText) {
         element = el as HTMLElement;
+        addLog("完全一致で要素を発見", "success");
         break;
+      }
+    }
+
+    // Try partial match if exact match not found
+    if (!element) {
+      for (const el of Array.from(allElements)) {
+        const elementText = el.textContent?.toLowerCase().trim() || "";
+        if (elementText.includes(normalizedText) || normalizedText.includes(elementText)) {
+          element = el as HTMLElement;
+          addLog("部分一致で要素を発見", "success");
+          break;
+        }
+      }
+    }
+
+    // For links, also try matching href
+    if (!element) {
+      const links = document.querySelectorAll("a[href]");
+      for (const link of Array.from(links)) {
+        const href = link.getAttribute("href") || "";
+        const linkText = link.textContent?.toLowerCase().trim() || "";
+
+        // Check if text matches href or link text
+        if (href.toLowerCase().includes(normalizedText) ||
+            linkText.includes(normalizedText)) {
+          element = link as HTMLElement;
+          addLog("リンクのhrefまたはテキストで要素を発見", "success");
+          break;
+        }
       }
     }
   }
@@ -1420,11 +1944,18 @@ async function clickElement(selector?: string, text?: string): Promise<void> {
     );
     console.log("Clicked element:", element);
   } else {
+    // List available links for debugging
+    const availableLinks = Array.from(document.querySelectorAll("a"))
+      .slice(0, 10)
+      .map(link => link.textContent?.trim().substring(0, 50))
+      .filter(Boolean);
+
     const searchCriteria = selector
       ? `selector: ${selector}${text ? `, text: ${text}` : ""}`
       : `text: ${text}`;
     const errorMsg = `要素が見つかりませんでした (${searchCriteria})`;
     addLog(errorMsg, "error");
+    addLog(`利用可能なリンク（最初の10件）: ${availableLinks.join(", ")}`, "info");
     throw new Error(errorMsg);
   }
 }
