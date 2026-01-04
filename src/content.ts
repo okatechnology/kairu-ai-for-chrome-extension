@@ -8,9 +8,6 @@ const KAIRU_INPUT_ID = "kairu-ai-input";
 // Kairu enabled state
 let kairuEnabled = false;
 
-// Flag to allow AI operations temporarily
-let isAIOperating = false;
-
 // Conversation history (keep last 1000 messages)
 interface Message {
   role: "user" | "assistant";
@@ -19,34 +16,86 @@ interface Message {
 let conversationHistory: Message[] = [];
 const MAX_HISTORY_LENGTH = 1000;
 
+// サイト種別
+type SiteType = "text" | "sns" | "video";
+
 // Quiz-related state
 interface VisitedSite {
   url: string;
   title: string;
   visitedAt: number;
   content: string; // Summary of page content
+  siteType: SiteType; // サイトの種別
+}
+
+// 日付別の閲覧履歴
+interface DailyVisitedSites {
+  [date: string]: VisitedSite[]; // 日付 (YYYY-MM-DD) をキーとした閲覧履歴
+}
+
+// 1問分のクイズ
+interface QuizQuestion {
+  question: string;
+  options: string[]; // 3 choices
+  correctAnswer: number; // Index of correct answer (0-2)
 }
 
 interface QuizState {
   isQuizMode: boolean;
   currentQuiz: {
     question: string;
-    options: string[]; // 4 choices
+    options: string[]; // 3-4 choices (legacy support)
     correctAnswer: number; // Index of correct answer (0-3)
   } | null;
   attempts: number;
+  // 新しい5問クイズ用
+  quizQuestions: QuizQuestion[]; // 5問のクイズ
+  currentQuestionIndex: number; // 現在の問題番号 (0-4)
+  correctCount: number; // 正解数
 }
 
 let messageCount = 0; // Count of user-assistant message pairs
 let lastQuizCount = 0; // Message count when last quiz was given
 let visitedSites: VisitedSite[] = [];
+let dailyVisitedSites: DailyVisitedSites = {}; // 日付別の閲覧履歴
+let lastSessionEnd: number = 0; // 前回セッション終了時のタイムスタンプ（レガシー）
+let lastMessageSent: number = 0; // 最後にメッセージを送った時刻
+let quizShownToday: string = ""; // 今日クイズを表示した日付 (YYYY-MM-DD)
 let quizState: QuizState = {
   isQuizMode: false,
   currentQuiz: null,
   attempts: 0,
+  quizQuestions: [],
+  currentQuestionIndex: 0,
+  correctCount: 0,
 };
+
+// クイズ生成中フラグ（多重送信防止用）
+let isGeneratingQuiz = false;
+// クイズ生成ID（多重レスポンス破棄用）
+let currentQuizGenerationId: string | null = null;
 const MAX_VISITED_SITES = 50; // Keep track of last 50 sites
-const QUIZ_INTERVAL = 5; // Quiz every 5 message pairs
+const QUIZ_INTERVAL = 5; // Quiz every 5 message pairs (legacy, not used in new logic)
+
+// ========================================
+// クイズ出題タイミング設定
+// ========================================
+const QUIZ_INTERVAL_MS_NORMAL = 24 * 60 * 60 * 1000; // 本番: 24時間
+const QUIZ_INTERVAL_MS_DEBUG = 20 * 1000; // デバッグ: 30秒
+
+// デバッグモードフラグ
+let debugMode = false;
+
+// クイズ間隔を取得する関数
+function getQuizIntervalMs(): number {
+  return debugMode ? QUIZ_INTERVAL_MS_DEBUG : QUIZ_INTERVAL_MS_NORMAL;
+}
+
+// クイズの問題数
+const QUIZ_QUESTION_COUNT = 5;
+
+// 日別閲覧履歴の最大保持日数
+const MAX_DAILY_HISTORY_DAYS = 7;
 
 // Storage keys
 const STORAGE_KEYS = {
@@ -60,6 +109,10 @@ const STORAGE_KEYS = {
   VISITED_SITES: "kairu_visited_sites",
   QUIZ_STATE: "kairu_quiz_state",
   WINDOW_OPEN: "kairu_window_open",
+  LAST_SESSION_END: "kairu_last_session_end", // 前回終了時のタイムスタンプ（レガシー）
+  LAST_MESSAGE_SENT: "kairu_last_message_sent", // 最後にメッセージを送った時刻
+  DAILY_VISITED_SITES: "kairu_daily_visited_sites", // 日付別の閲覧履歴
+  QUIZ_SHOWN_TODAY: "kairu_quiz_shown_today", // 今日クイズを表示したか
 };
 
 // Check if extension context is valid
@@ -151,7 +204,8 @@ async function restoreChatHistory() {
     console.log("[Kairu] Restoring chat history from storage:", result);
     if (result[STORAGE_KEYS.CHAT_HISTORY]) {
       chatHistory.innerHTML = result[STORAGE_KEYS.CHAT_HISTORY];
-      chatHistory.scrollTop = chatHistory.scrollHeight;
+      // Don't scroll here - window might be hidden (display: none)
+      // Scrolling will be done in restoreWindowState if window is open
       console.log("[Kairu] Chat history restored successfully");
     } else {
       console.log("[Kairu] No chat history found in storage");
@@ -188,12 +242,6 @@ async function restoreEnabledState() {
       if (container) {
         container.style.display = kairuEnabled ? "block" : "none";
       }
-      // Block/unblock page scroll
-      if (kairuEnabled) {
-        document.body.style.overflow = "hidden";
-      } else {
-        document.body.style.overflow = "";
-      }
       console.log("[Kairu] Enabled state restored successfully:", kairuEnabled);
     } else {
       console.log("[Kairu] No enabled state found in storage");
@@ -201,6 +249,117 @@ async function restoreEnabledState() {
   } catch (error) {
     if (handleContextInvalidation(error)) return;
     console.error("[Kairu] Failed to restore enabled state:", error);
+  }
+}
+
+// Restore debug mode from storage
+async function restoreDebugMode() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    const result = await chrome.storage.local.get("kairu_debug_mode");
+    if (result.kairu_debug_mode !== undefined) {
+      debugMode = result.kairu_debug_mode;
+      console.log("[Kairu] Debug mode restored:", debugMode);
+      updateDebugUIVisibility();
+    }
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to restore debug mode:", error);
+  }
+}
+
+// Quiz timer update interval
+let quizTimerInterval: ReturnType<typeof setInterval> | null = null;
+
+// Update debug UI visibility based on debug mode
+function updateDebugUIVisibility() {
+  const debugLog = document.getElementById("kairu-debug-log");
+  const quizTimer = document.getElementById("kairu-next-quiz-timer");
+
+  if (debugLog) {
+    debugLog.style.display = debugMode ? "block" : "none";
+  }
+
+  if (quizTimer) {
+    quizTimer.style.display = debugMode ? "block" : "none";
+  }
+
+  // Start or stop quiz timer updates
+  if (debugMode) {
+    startQuizTimerUpdates();
+  } else {
+    stopQuizTimerUpdates();
+  }
+}
+
+// Start periodic quiz timer updates
+function startQuizTimerUpdates() {
+  // Clear existing interval
+  if (quizTimerInterval !== null) {
+    clearInterval(quizTimerInterval);
+  }
+
+  // Update immediately
+  updateQuizTimerDisplay();
+
+  // Update every second
+  quizTimerInterval = setInterval(updateQuizTimerDisplay, 1000);
+}
+
+// Stop quiz timer updates
+function stopQuizTimerUpdates() {
+  if (quizTimerInterval !== null) {
+    clearInterval(quizTimerInterval);
+    quizTimerInterval = null;
+  }
+}
+
+// Update quiz timer display
+function updateQuizTimerDisplay() {
+  const timerText = document.getElementById("kairu-next-quiz-text");
+  if (!timerText) return;
+
+  // クイズモード中は別のメッセージを表示
+  if (quizState.isQuizMode) {
+    timerText.textContent = "クイズモード中";
+    return;
+  }
+
+  // クイズ生成中は別のメッセージを表示
+  if (isGeneratingQuiz) {
+    timerText.textContent = "クイズ生成中...";
+    return;
+  }
+
+  // まだメッセージを送ったことがない場合
+  if (lastMessageSent === 0) {
+    timerText.textContent = "メッセージ送信後にカウント開始";
+    return;
+  }
+
+  const now = Date.now();
+  const quizInterval = getQuizIntervalMs();
+  const timeSinceLastMessage = now - lastMessageSent;
+  const timeRemaining = quizInterval - timeSinceLastMessage;
+
+  if (timeRemaining <= 0) {
+    timerText.textContent = "次のフォーカスでクイズ出題";
+  } else {
+    // 時間をフォーマット
+    const seconds = Math.floor(timeRemaining / 1000);
+    const minutes = Math.floor(seconds / 60);
+    const hours = Math.floor(minutes / 60);
+
+    if (hours > 0) {
+      timerText.textContent = `次のクイズまで: ${hours}時間${minutes % 60}分${
+        seconds % 60
+      }秒`;
+    } else if (minutes > 0) {
+      timerText.textContent = `次のクイズまで: ${minutes}分${seconds % 60}秒`;
+    } else {
+      timerText.textContent = `次のクイズまで: ${seconds}秒`;
+    }
   }
 }
 
@@ -254,14 +413,34 @@ async function restoreWindowState() {
     if (inputPanel) {
       const isOpen = result[STORAGE_KEYS.WINDOW_OPEN] === true;
       inputPanel.style.display = isOpen ? "block" : "none";
-      console.log("[Kairu] Window state restored successfully:", isOpen ? "open" : "closed");
+      console.log(
+        "[Kairu] Window state restored successfully:",
+        isOpen ? "open" : "closed"
+      );
 
       // Scroll chat history to bottom if window is open
+      // Use requestAnimationFrame + setTimeout to ensure layout is complete
       if (isOpen) {
-        const chatHistory = document.getElementById("kairu-chat-history");
-        if (chatHistory) {
-          chatHistory.scrollTop = chatHistory.scrollHeight;
-        }
+        requestAnimationFrame(() => {
+          setTimeout(() => {
+            const chatHistory = document.getElementById("kairu-chat-history");
+            if (chatHistory) {
+              console.log(
+                "[Kairu] Before scroll - scrollTop:",
+                chatHistory.scrollTop,
+                "scrollHeight:",
+                chatHistory.scrollHeight
+              );
+              chatHistory.scrollTop = chatHistory.scrollHeight;
+              console.log(
+                "[Kairu] After scroll - scrollTop:",
+                chatHistory.scrollTop,
+                "scrollHeight:",
+                chatHistory.scrollHeight
+              );
+            }
+          }, 100);
+        });
       }
     }
   } catch (error) {
@@ -327,7 +506,9 @@ async function saveMessageCount() {
   if (!isExtensionContextValid()) return;
 
   try {
-    await chrome.storage.local.set({ [STORAGE_KEYS.MESSAGE_COUNT]: messageCount });
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.MESSAGE_COUNT]: messageCount,
+    });
     console.log("[Kairu] Message count saved to storage:", messageCount);
   } catch (error) {
     if (handleContextInvalidation(error)) return;
@@ -356,7 +537,9 @@ async function saveLastQuizCount() {
   if (!isExtensionContextValid()) return;
 
   try {
-    await chrome.storage.local.set({ [STORAGE_KEYS.LAST_QUIZ_COUNT]: lastQuizCount });
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.LAST_QUIZ_COUNT]: lastQuizCount,
+    });
     console.log("[Kairu] Last quiz count saved to storage:", lastQuizCount);
   } catch (error) {
     if (handleContextInvalidation(error)) return;
@@ -385,7 +568,9 @@ async function saveVisitedSites() {
   if (!isExtensionContextValid()) return;
 
   try {
-    await chrome.storage.local.set({ [STORAGE_KEYS.VISITED_SITES]: visitedSites });
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.VISITED_SITES]: visitedSites,
+    });
     console.log("[Kairu] Visited sites saved to storage:", visitedSites.length);
   } catch (error) {
     if (handleContextInvalidation(error)) return;
@@ -430,11 +615,293 @@ async function restoreQuizState() {
     const result = await chrome.storage.local.get(STORAGE_KEYS.QUIZ_STATE);
     if (result[STORAGE_KEYS.QUIZ_STATE]) {
       quizState = result[STORAGE_KEYS.QUIZ_STATE];
-      console.log("[Kairu] Quiz state restored");
+      console.log("[Kairu] Quiz state restored:", quizState);
+
+      // If in quiz mode, regenerate quiz buttons (they don't have event listeners after reload)
+      if (quizState.isQuizMode && quizState.currentQuiz) {
+        console.log("[Kairu] Regenerating quiz buttons after reload");
+
+        // Remove old quiz message from chat history
+        const oldQuiz = document.getElementById("kairu-current-quiz");
+        if (oldQuiz) {
+          oldQuiz.remove();
+        }
+
+        // Regenerate quiz with working buttons
+        addQuizMessage(
+          quizState.currentQuiz.question,
+          quizState.currentQuiz.options
+        );
+      }
     }
   } catch (error) {
     if (handleContextInvalidation(error)) return;
     console.error("[Kairu] Failed to restore quiz state:", error);
+  }
+}
+
+// Save last session end timestamp
+async function saveLastSessionEnd() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    lastSessionEnd = Date.now();
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.LAST_SESSION_END]: lastSessionEnd,
+    });
+    console.log(
+      "[Kairu] Last session end saved:",
+      new Date(lastSessionEnd).toLocaleString()
+    );
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to save last session end:", error);
+  }
+}
+
+// Restore last session end timestamp
+async function restoreLastSessionEnd() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    const result = await chrome.storage.local.get(
+      STORAGE_KEYS.LAST_SESSION_END
+    );
+    if (result[STORAGE_KEYS.LAST_SESSION_END]) {
+      lastSessionEnd = result[STORAGE_KEYS.LAST_SESSION_END];
+      console.log(
+        "[Kairu] Last session end restored:",
+        new Date(lastSessionEnd).toLocaleString()
+      );
+    }
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to restore last session end:", error);
+  }
+}
+
+// Save last message sent timestamp
+async function saveLastMessageSent() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    lastMessageSent = Date.now();
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.LAST_MESSAGE_SENT]: lastMessageSent,
+    });
+    console.log(
+      "[Kairu] Last message sent saved:",
+      new Date(lastMessageSent).toLocaleString()
+    );
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to save last message sent:", error);
+  }
+}
+
+// Restore last message sent timestamp
+async function restoreLastMessageSent() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    const result = await chrome.storage.local.get(
+      STORAGE_KEYS.LAST_MESSAGE_SENT
+    );
+    if (result[STORAGE_KEYS.LAST_MESSAGE_SENT]) {
+      lastMessageSent = result[STORAGE_KEYS.LAST_MESSAGE_SENT];
+      console.log(
+        "[Kairu] Last message sent restored:",
+        new Date(lastMessageSent).toLocaleString()
+      );
+    }
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to restore last message sent:", error);
+  }
+}
+
+// Get today's date string (YYYY-MM-DD)
+function getTodayDateString(): string {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(
+    2,
+    "0"
+  )}-${String(now.getDate()).padStart(2, "0")}`;
+}
+
+// Get yesterday's date string (YYYY-MM-DD)
+function getYesterdayDateString(): string {
+  const now = new Date();
+  now.setDate(now.getDate() - 1);
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(
+    2,
+    "0"
+  )}-${String(now.getDate()).padStart(2, "0")}`;
+}
+
+// Format timestamp to human-readable time (e.g., "2026年1月4日 14:30頃")
+function formatVisitTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  const year = date.getFullYear();
+  const month = date.getMonth() + 1;
+  const day = date.getDate();
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+
+  return `${year}年${month}月${day}日 ${hours}:${minutes}頃`;
+}
+
+// Save daily visited sites to storage
+async function saveDailyVisitedSites() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.DAILY_VISITED_SITES]: dailyVisitedSites,
+    });
+    console.log("[Kairu] Daily visited sites saved");
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to save daily visited sites:", error);
+  }
+}
+
+// Restore daily visited sites from storage
+async function restoreDailyVisitedSites() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    const result = await chrome.storage.local.get(
+      STORAGE_KEYS.DAILY_VISITED_SITES
+    );
+    if (result[STORAGE_KEYS.DAILY_VISITED_SITES]) {
+      dailyVisitedSites = result[STORAGE_KEYS.DAILY_VISITED_SITES];
+      console.log(
+        "[Kairu] Daily visited sites restored:",
+        Object.keys(dailyVisitedSites).length,
+        "days"
+      );
+
+      // Clean up old entries (keep only last MAX_DAILY_HISTORY_DAYS days)
+      cleanupOldDailyHistory();
+    }
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to restore daily visited sites:", error);
+  }
+}
+
+// Clean up daily history older than MAX_DAILY_HISTORY_DAYS
+async function cleanupOldDailyHistory() {
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - MAX_DAILY_HISTORY_DAYS);
+  const cutoffDateString = `${cutoffDate.getFullYear()}-${String(
+    cutoffDate.getMonth() + 1
+  ).padStart(2, "0")}-${String(cutoffDate.getDate()).padStart(2, "0")}`;
+
+  let cleaned = false;
+  for (const dateKey of Object.keys(dailyVisitedSites)) {
+    if (dateKey < cutoffDateString) {
+      delete dailyVisitedSites[dateKey];
+      cleaned = true;
+    }
+  }
+
+  if (cleaned) {
+    await saveDailyVisitedSites();
+    console.log("[Kairu] Cleaned up old daily history");
+  }
+}
+
+// Save quiz shown today flag
+async function saveQuizShownToday() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    await chrome.storage.local.set({
+      [STORAGE_KEYS.QUIZ_SHOWN_TODAY]: quizShownToday,
+    });
+    console.log("[Kairu] Quiz shown today saved:", quizShownToday);
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to save quiz shown today:", error);
+  }
+}
+
+// Restore quiz shown today flag
+async function restoreQuizShownToday() {
+  if (!isExtensionContextValid()) return;
+
+  try {
+    const result = await chrome.storage.local.get(
+      STORAGE_KEYS.QUIZ_SHOWN_TODAY
+    );
+    if (result[STORAGE_KEYS.QUIZ_SHOWN_TODAY]) {
+      quizShownToday = result[STORAGE_KEYS.QUIZ_SHOWN_TODAY];
+      console.log("[Kairu] Quiz shown today restored:", quizShownToday);
+    }
+  } catch (error) {
+    if (handleContextInvalidation(error)) return;
+    console.error("[Kairu] Failed to restore quiz shown today:", error);
+  }
+}
+
+// SNS・動画サイトのドメインリスト
+const SNS_VIDEO_DOMAINS = [
+  "youtube.com",
+  "www.youtube.com",
+  "twitter.com",
+  "x.com",
+  "facebook.com",
+  "www.facebook.com",
+  "instagram.com",
+  "www.instagram.com",
+  "tiktok.com",
+  "www.tiktok.com",
+  "twitch.tv",
+  "www.twitch.tv",
+  "nicovideo.jp",
+  "www.nicovideo.jp",
+  "dailymotion.com",
+  "www.dailymotion.com",
+  "vimeo.com",
+  "www.vimeo.com",
+  "reddit.com",
+  "www.reddit.com",
+  "threads.net",
+  "www.threads.net",
+  "linkedin.com",
+  "www.linkedin.com",
+];
+
+// サイト種別を判定する関数
+function detectSiteType(url: string): SiteType {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+
+    // SNS・動画サイトかチェック
+    for (const domain of SNS_VIDEO_DOMAINS) {
+      if (hostname === domain || hostname.endsWith("." + domain)) {
+        // YouTube, TikTok, Twitch, ニコ動などは動画サイト
+        if (
+          hostname.includes("youtube") ||
+          hostname.includes("tiktok") ||
+          hostname.includes("twitch") ||
+          hostname.includes("nicovideo") ||
+          hostname.includes("dailymotion") ||
+          hostname.includes("vimeo")
+        ) {
+          return "video";
+        }
+        // それ以外はSNS
+        return "sns";
+      }
+    }
+
+    // デフォルトはテキストベース
+    return "text";
+  } catch {
+    return "text";
   }
 }
 
@@ -446,14 +913,20 @@ async function recordSiteVisit() {
   // Get page content summary (first 500 characters of visible text)
   const pageText = document.body.innerText.substring(0, 500);
 
+  // サイト種別を判定
+  const siteType = detectSiteType(currentUrl);
+
   // Check if this URL is already in the list (update if exists)
-  const existingIndex = visitedSites.findIndex(site => site.url === currentUrl);
+  const existingIndex = visitedSites.findIndex(
+    (site) => site.url === currentUrl
+  );
 
   const siteInfo: VisitedSite = {
     url: currentUrl,
     title: currentTitle,
     visitedAt: Date.now(),
     content: pageText,
+    siteType: siteType,
   };
 
   if (existingIndex >= 0) {
@@ -470,10 +943,66 @@ async function recordSiteVisit() {
   }
 
   await saveVisitedSites();
-  console.log("[Kairu] Recorded site visit:", currentTitle);
+
+  // 日付別履歴にも追加
+  const today = getTodayDateString();
+  if (!dailyVisitedSites[today]) {
+    dailyVisitedSites[today] = [];
+  }
+
+  // 同じURLが今日すでにあれば更新、なければ追加
+  const dailyExistingIndex = dailyVisitedSites[today].findIndex(
+    (site) => site.url === currentUrl
+  );
+  if (dailyExistingIndex >= 0) {
+    dailyVisitedSites[today][dailyExistingIndex] = siteInfo;
+  } else {
+    dailyVisitedSites[today].push(siteInfo);
+
+    // 1日あたりの最大件数制限
+    if (dailyVisitedSites[today].length > MAX_VISITED_SITES) {
+      dailyVisitedSites[today] = dailyVisitedSites[today].slice(
+        -MAX_VISITED_SITES
+      );
+    }
+  }
+
+  await saveDailyVisitedSites();
+  console.log("[Kairu] Recorded site visit:", currentTitle, "type:", siteType);
 }
 
-// Check if it's time to show a quiz
+// Check if it's time to show a quiz (triggered on input focus)
+function shouldShowQuizOnFocus(): boolean {
+  // Don't show quiz if already in quiz mode
+  if (quizState.isQuizMode) {
+    console.log("[Kairu] Quiz check: already in quiz mode");
+    return false;
+  }
+
+  // Check if enough time has passed since last message sent
+  if (lastMessageSent === 0) {
+    console.log("[Kairu] Quiz check: no previous message");
+    return false;
+  }
+
+  const timeSinceLastMessage = Date.now() - lastMessageSent;
+  const quizInterval = getQuizIntervalMs();
+  if (timeSinceLastMessage < quizInterval) {
+    console.log(
+      "[Kairu] Quiz check: not enough time passed",
+      timeSinceLastMessage,
+      "ms (need",
+      quizInterval,
+      "ms)"
+    );
+    return false;
+  }
+
+  console.log("[Kairu] Quiz check: should show quiz!");
+  return true;
+}
+
+// Legacy function - check if it's time to show a quiz (based on message count)
 function shouldShowQuiz(): boolean {
   // Don't show quiz if already in quiz mode
   if (quizState.isQuizMode) {
@@ -491,17 +1020,20 @@ function shouldShowQuiz(): boolean {
 }
 
 // Generate quiz using OpenAI API
-async function generateQuiz(apiKey: string): Promise<{ question: string; options: string[]; correctAnswer: number }> {
+async function generateQuiz(
+  apiKey: string
+): Promise<{ question: string; options: string[]; correctAnswer: number }> {
   // Select a random visited site (not the current one)
   const currentUrl = window.location.href;
-  const eligibleSites = visitedSites.filter(site => site.url !== currentUrl);
+  const eligibleSites = visitedSites.filter((site) => site.url !== currentUrl);
 
   if (eligibleSites.length === 0) {
     // Fallback to all sites if current URL doesn't match
     eligibleSites.push(...visitedSites);
   }
 
-  const randomSite = eligibleSites[Math.floor(Math.random() * eligibleSites.length)];
+  const randomSite =
+    eligibleSites[Math.floor(Math.random() * eligibleSites.length)];
 
   const quizPrompt = `以下のサイト情報を基に、ユーザーが過去に訪問したサイトの内容を理解しているか確認するための4択クイズを1つ作成してください。
 
@@ -545,7 +1077,8 @@ async function generateQuiz(apiKey: string): Promise<{ question: string; options
       messages: [
         {
           role: "system",
-          content: "あなたはクイズを作成するアシスタントです。ユーザーが訪問したサイトの内容を理解しているか確認する4択クイズを作成します。",
+          content:
+            "あなたはクイズを作成するアシスタントです。ユーザーが訪問したサイトの内容を理解しているか確認する4択クイズを作成します。",
         },
         {
           role: "user",
@@ -575,6 +1108,387 @@ async function generateQuiz(apiKey: string): Promise<{ question: string; options
   };
 }
 
+// Generate 5 quizzes based on browsing history since last quiz
+async function generateDailyQuizzes(apiKey: string): Promise<QuizQuestion[]> {
+  // 前回クイズ出題後から今までの閲覧履歴を使用
+  const sitesForQuiz = [...visitedSites];
+
+  // 閲覧履歴がない場合は空配列を返す（クイズをスキップ）
+  if (sitesForQuiz.length === 0) {
+    console.log("[Kairu] 閲覧履歴がないためクイズをスキップ");
+    return [];
+  }
+
+  // サイトをテキスト系とSNS/動画系に分類
+  const textSites = sitesForQuiz.filter((site) => site.siteType === "text");
+  const snsVideoSites = sitesForQuiz.filter(
+    (site) => site.siteType === "sns" || site.siteType === "video"
+  );
+
+  // クイズ生成用のプロンプトを作成
+  let quizPrompt = `ユーザーが最近閲覧したサイトの情報を基に、${QUIZ_QUESTION_COUNT}問の3択クイズを作成してください。
+
+## 閲覧したサイト一覧:\n`;
+
+  // サイト情報を追加（閲覧時刻を含める）
+  sitesForQuiz.forEach((site) => {
+    const visitTimeStr = formatVisitTime(site.visitedAt);
+    quizPrompt += `
+### ${site.title}
+- URL: ${site.url}
+- 閲覧時刻: ${visitTimeStr}
+- 種別: ${
+      site.siteType === "text"
+        ? "テキストベース"
+        : site.siteType === "sns"
+        ? "SNS"
+        : "動画サイト"
+    }
+- 内容の一部: ${site.content.substring(0, 300)}
+`;
+  });
+
+  quizPrompt += `
+## クイズ作成のルール:
+
+### 絶対に禁止:
+- 「サイト1」「サイト2」「サイト49」のような「サイト + 数字」という表現は絶対に使わないでください
+- URLやURLの一部（パス、ID、パラメータなど）に関する問題は絶対に出さないでください
+- 例えば「このURLのパスは？」「status/123456のIDは？」のような問題は禁止です
+- 質問文や選択肢にURLをそのまま含めないでください
+
+### 良いクイズの例:
+- 「○○というサイトで読んだ記事のテーマは何でしたか？」
+- 「YouTubeで見た動画のジャンルは？」
+- 「1月4日の午後に閲覧したサイトはどれですか？」
+- 「○○の記事で紹介されていた内容として正しいものは？」
+
+### テキストベースのサイトに関するクイズ（${textSites.length}件のサイトがあります）:
+- サイトの内容に関する具体的な質問を作成
+- ページの内容やテーマについて質問する
+
+### SNS・動画サイトに関するクイズ（${snsVideoSites.length}件のサイトがあります）:
+- 閲覧履歴の流れや閲覧時刻に関する質問を作成
+- どのサイトを見たか、いつ見たかなどを質問する
+- 例: 「14時頃に閲覧していたサイトは何でしたか。」
+- 例: 「昨日の夜に見ていたサイトはどれでしょうか。」
+
+### 共通ルール:
+1. 各問題は3つの選択肢を用意（1つが正解、2つが不正解）
+2. 不正解の選択肢は、もっともらしいが明らかに違うものにする
+3. 正解の選択肢のインデックス（0-2）も返す
+4. テキストベースサイトとSNS/動画サイトの両方からバランスよく出題する
+5. 閲覧時刻を活用した問題も積極的に出題する
+
+## 出力形式（厳守）:
+以下のJSON配列形式で${QUIZ_QUESTION_COUNT}問分を応答してください：
+[
+  {
+    "question": "質問文1",
+    "options": ["選択肢A", "選択肢B", "選択肢C"],
+    "correctAnswer": 0
+  },
+  {
+    "question": "質問文2",
+    "options": ["選択肢A", "選択肢B", "選択肢C"],
+    "correctAnswer": 1
+  },
+  ...
+]`;
+
+  addLog("5問クイズ生成プロンプトを送信中...", "info");
+  addRawLog("クイズ生成プロンプト", quizPrompt);
+
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-5-nano",
+      messages: [
+        {
+          role: "system",
+          content:
+            "あなたはクイズを作成するアシスタントです。ユーザーが最近訪問したサイトの内容を理解しているか確認する3択クイズを5問作成します。必ずJSON配列形式で応答してください。",
+        },
+        {
+          role: "user",
+          content: quizPrompt,
+        },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Quiz generation failed: ${response.status}`);
+  }
+
+  const data = await response.json();
+  let aiResponseContent = data.choices[0].message.content;
+
+  addLog("5問クイズ生成完了", "success");
+  addRawLog("クイズ生成レスポンス", aiResponseContent);
+
+  // JSONブロックから配列を抽出（```json ... ``` に囲まれている場合の対応）
+  const jsonMatch = aiResponseContent.match(/```json\s*([\s\S]*?)\s*```/);
+  if (jsonMatch) {
+    aiResponseContent = jsonMatch[1];
+  }
+
+  const quizzes: QuizQuestion[] = JSON.parse(aiResponseContent);
+
+  // 5問に足りない場合は補完
+  while (quizzes.length < QUIZ_QUESTION_COUNT) {
+    quizzes.push({
+      question: `最近訪問したサイトについての質問です。（問題${
+        quizzes.length + 1
+      }）`,
+      options: ["選択肢A", "選択肢B", "選択肢C"],
+      correctAnswer: 0,
+    });
+  }
+
+  return quizzes.slice(0, QUIZ_QUESTION_COUNT);
+}
+
+// Start new 5-question quiz mode (startup quiz)
+async function startStartupQuizMode(apiKey: string): Promise<void> {
+  // 多重送信防止: 既に生成中またはクイズモード中は何もしない
+  if (isGeneratingQuiz) {
+    addLog("クイズ生成中のため、新しいクイズ生成をスキップしました", "warning");
+    return;
+  }
+  if (quizState.isQuizMode) {
+    addLog(
+      "クイズモード中のため、新しいクイズ生成をスキップしました",
+      "warning"
+    );
+    return;
+  }
+
+  // クイズ生成開始
+  isGeneratingQuiz = true;
+  const generationId = `quiz_${Date.now()}_${Math.random()
+    .toString(36)
+    .substr(2, 9)}`;
+  currentQuizGenerationId = generationId;
+
+  addLog("スタートアップクイズモードを開始します（5問）", "info");
+
+  // 吹き出しを表示し、入力を無効化
+  setQuizBubbleVisible(true);
+  setInputDisabled(true, "クイズを作成中...");
+
+  try {
+    // Generate 5 quizzes
+    const quizzes = await generateDailyQuizzes(apiKey);
+
+    // 多重レスポンス破棄: 生成IDが変わっていたら結果を無視
+    if (currentQuizGenerationId !== generationId) {
+      addLog("古いクイズ生成レスポンスを破棄しました", "warning");
+      return;
+    }
+
+    // 吹き出しを非表示
+    setQuizBubbleVisible(false);
+
+    // 昨日の履歴がない場合はスキップ
+    if (quizzes.length === 0) {
+      addLog("昨日の閲覧履歴がないためクイズをスキップしました", "info");
+      isGeneratingQuiz = false;
+      currentQuizGenerationId = null;
+      setInputDisabled(false);
+      return;
+    }
+
+    // Set quiz state
+    quizState.isQuizMode = true;
+    quizState.quizQuestions = quizzes;
+    quizState.currentQuestionIndex = 0;
+    quizState.correctCount = 0;
+    quizState.currentQuiz = quizzes[0];
+    quizState.attempts = 0;
+
+    await saveQuizState();
+
+    // Mark as shown today
+    quizShownToday = getTodayDateString();
+    await saveQuizShownToday();
+
+    // Clear visited sites after quiz generation (for next quiz cycle)
+    visitedSites = [];
+    await saveVisitedSites();
+
+    // Disable input during quiz mode (update placeholder)
+    setInputDisabled(true, "クイズに回答してください...");
+
+    // Show first question
+    addChatMessage(
+      `🎯 最近の閲覧内容に関するクイズです！（全${QUIZ_QUESTION_COUNT}問）`,
+      "assistant"
+    );
+    addQuizMessage(`Q1. ${quizzes[0].question}`, quizzes[0].options);
+    addLog("スタートアップクイズを出題しました（問1）", "success");
+  } catch (error) {
+    addLog(`クイズ生成エラー: ${(error as Error).message}`, "error");
+    console.error("Quiz generation error:", error);
+    setQuizBubbleVisible(false);
+    setInputDisabled(false);
+  } finally {
+    isGeneratingQuiz = false;
+    currentQuizGenerationId = null;
+  }
+}
+
+// Enable/disable input field during quiz mode
+function setInputDisabled(disabled: boolean, placeholder?: string) {
+  const input = document.getElementById(KAIRU_INPUT_ID) as HTMLTextAreaElement;
+  const submitBtn = document.getElementById(
+    "kairu-submit-btn"
+  ) as HTMLButtonElement;
+
+  if (input) {
+    // disabledにする場合はフォーカスを外す
+    if (disabled && document.activeElement === input) {
+      input.blur();
+    }
+    input.disabled = disabled;
+    if (disabled) {
+      input.placeholder = placeholder || "クイズに回答してください...";
+      input.classList.add("quiz-disabled");
+    } else {
+      input.placeholder = "やりたいことを入力してください...";
+      input.classList.remove("quiz-disabled");
+    }
+  }
+
+  if (submitBtn) {
+    submitBtn.disabled = disabled;
+  }
+}
+
+// Show/hide quiz generation bubble
+function setQuizBubbleVisible(visible: boolean) {
+  const bubble = document.getElementById("kairu-quiz-bubble");
+  if (bubble) {
+    bubble.style.display = visible ? "block" : "none";
+  }
+}
+
+// Check startup quiz answer and proceed to next question
+async function checkStartupQuizAnswer(selectedIndex: number): Promise<void> {
+  if (!quizState.isQuizMode || quizState.quizQuestions.length === 0) {
+    return;
+  }
+
+  const currentQuestion =
+    quizState.quizQuestions[quizState.currentQuestionIndex];
+  const isCorrect = selectedIndex === currentQuestion.correctAnswer;
+
+  // Get quiz buttons
+  const quizMessage = document.getElementById("kairu-current-quiz");
+  const buttons = quizMessage?.querySelectorAll(".quiz-option-btn");
+
+  // Update button colors
+  if (buttons) {
+    // Show selected button result
+    if (buttons[selectedIndex]) {
+      (buttons[selectedIndex] as HTMLButtonElement).style.background = isCorrect
+        ? "#4caf50"
+        : "#f44336";
+      (buttons[selectedIndex] as HTMLButtonElement).style.borderColor =
+        isCorrect ? "#4caf50" : "#f44336";
+      (buttons[selectedIndex] as HTMLButtonElement).style.color = "white";
+    }
+    // Show correct answer if wrong
+    if (!isCorrect && buttons[currentQuestion.correctAnswer]) {
+      (
+        buttons[currentQuestion.correctAnswer] as HTMLButtonElement
+      ).style.background = "#4caf50";
+      (
+        buttons[currentQuestion.correctAnswer] as HTMLButtonElement
+      ).style.borderColor = "#4caf50";
+      (
+        buttons[currentQuestion.correctAnswer] as HTMLButtonElement
+      ).style.color = "white";
+    }
+  }
+
+  if (isCorrect) {
+    quizState.correctCount++;
+    addChatMessage(`✅ 正解！`, "assistant");
+  } else {
+    const correctOption =
+      currentQuestion.options[currentQuestion.correctAnswer];
+    addChatMessage(
+      `❌ 不正解。正解は「${correctOption}」でした。`,
+      "assistant"
+    );
+  }
+
+  // Move to next question
+  quizState.currentQuestionIndex++;
+  await saveQuizState();
+
+  if (quizState.currentQuestionIndex < quizState.quizQuestions.length) {
+    // Show next question after a short delay
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    const nextQuestion =
+      quizState.quizQuestions[quizState.currentQuestionIndex];
+    quizState.currentQuiz = nextQuestion;
+    await saveQuizState();
+
+    addQuizMessage(
+      `Q${quizState.currentQuestionIndex + 1}. ${nextQuestion.question}`,
+      nextQuestion.options
+    );
+    addLog(
+      `クイズ問${quizState.currentQuestionIndex + 1}を出題しました`,
+      "info"
+    );
+  } else {
+    // All questions answered - show results
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    const scorePercent = Math.round(
+      (quizState.correctCount / QUIZ_QUESTION_COUNT) * 100
+    );
+    let resultMessage = `🏆 クイズ終了！\n\n結果: ${quizState.correctCount}/${QUIZ_QUESTION_COUNT}問正解 (${scorePercent}%)`;
+
+    if (scorePercent === 100) {
+      resultMessage += "\n\n🎉 パーフェクト！素晴らしいです！";
+    } else if (scorePercent >= 80) {
+      resultMessage += "\n\n😊 よくできました！";
+    } else if (scorePercent >= 60) {
+      resultMessage += "\n\n👍 まずまずですね！";
+    } else {
+      resultMessage += "\n\n💪 次回は頑張りましょう！";
+    }
+
+    addChatMessage(resultMessage, "assistant");
+
+    // Exit quiz mode
+    quizState.isQuizMode = false;
+    quizState.currentQuiz = null;
+    quizState.quizQuestions = [];
+    quizState.currentQuestionIndex = 0;
+    quizState.correctCount = 0;
+    quizState.attempts = 0;
+    await saveQuizState();
+
+    // Re-enable input
+    setInputDisabled(false);
+
+    // Reset last message sent time (for next quiz cycle)
+    await saveLastMessageSent();
+
+    addLog("スタートアップクイズ終了", "success");
+  }
+}
+
 // Start quiz mode
 async function startQuizMode(apiKey: string): Promise<void> {
   addLog("クイズモードを開始します", "info");
@@ -596,15 +1510,8 @@ async function startQuizMode(apiKey: string): Promise<void> {
     lastQuizCount = messageCount;
     await saveLastQuizCount();
 
-    // Format quiz message with options (with better spacing)
-    const optionsText = quiz.options
-      .map((option, index) => `${index + 1}. ${option}`)
-      .join("\n\n");
-
-    const quizMessage = `🎯 クイズタイム！\n\n${quiz.question}\n\n${optionsText}\n\n答えの番号（1-4）を入力してください。`;
-
-    // Show quiz to user (use "assistant" role for normal chat appearance)
-    addChatMessage(quizMessage, "assistant");
+    // Show quiz to user with button options
+    addQuizMessage(quiz.question, quiz.options);
     addLog("クイズを出題しました", "success");
   } catch (error) {
     addLog(`クイズ生成エラー: ${(error as Error).message}`, "error");
@@ -642,13 +1549,29 @@ async function checkQuizAnswer(userAnswer: string): Promise<boolean> {
   // Convert to 0-indexed
   const selectedIndex = answerNum - 1;
 
+  // Get quiz buttons
+  const quizMessage = document.getElementById("kairu-current-quiz");
+  const buttons = quizMessage?.querySelectorAll(".quiz-option-btn");
+
   // Check if answer is correct
   const isCorrect = selectedIndex === quizState.currentQuiz.correctAnswer;
 
   if (isCorrect) {
-    // Correct answer
-    const correctOption = quizState.currentQuiz.options[quizState.currentQuiz.correctAnswer];
-    addChatMessage(`🎉 正解です！素晴らしい！\n\n答え: ${correctOption}`, "assistant");
+    // Correct answer - highlight selected button as correct
+    if (buttons && buttons[selectedIndex]) {
+      (buttons[selectedIndex] as HTMLButtonElement).style.background =
+        "#4caf50";
+      (buttons[selectedIndex] as HTMLButtonElement).style.borderColor =
+        "#4caf50";
+      (buttons[selectedIndex] as HTMLButtonElement).style.color = "white";
+    }
+
+    const correctOption =
+      quizState.currentQuiz.options[quizState.currentQuiz.correctAnswer];
+    addChatMessage(
+      `🎉 正解です！素晴らしい！\n\n答え: ${correctOption}`,
+      "assistant"
+    );
     addLog("クイズに正解しました", "success");
 
     // Exit quiz mode
@@ -660,17 +1583,62 @@ async function checkQuizAnswer(userAnswer: string): Promise<boolean> {
 
     return true;
   } else {
-    // Incorrect answer
+    // Incorrect answer - highlight selected button as incorrect and show correct one
+    if (buttons) {
+      if (buttons[selectedIndex]) {
+        (buttons[selectedIndex] as HTMLButtonElement).style.background =
+          "#f44336";
+        (buttons[selectedIndex] as HTMLButtonElement).style.borderColor =
+          "#f44336";
+        (buttons[selectedIndex] as HTMLButtonElement).style.color = "white";
+      }
+
+      // Show correct answer after last attempt or on final answer
+      const maxAttempts = 3; // Allow 3 attempts
+      if (
+        quizState.attempts >= maxAttempts &&
+        buttons[quizState.currentQuiz.correctAnswer]
+      ) {
+        (
+          buttons[quizState.currentQuiz.correctAnswer] as HTMLButtonElement
+        ).style.background = "#4caf50";
+        (
+          buttons[quizState.currentQuiz.correctAnswer] as HTMLButtonElement
+        ).style.borderColor = "#4caf50";
+        (
+          buttons[quizState.currentQuiz.correctAnswer] as HTMLButtonElement
+        ).style.color = "white";
+      }
+    }
+
     const maxAttempts = 3; // Allow 3 attempts
 
     if (quizState.attempts < maxAttempts) {
-      // Allow retry
-      addChatMessage(`❌ 残念、違います。\n\nあと${maxAttempts - quizState.attempts}回挑戦できます。もう一度考えてみてください！`, "assistant");
+      // Allow retry - re-enable buttons except the wrong one
+      if (buttons) {
+        buttons.forEach((btn, index) => {
+          if (index !== selectedIndex) {
+            (btn as HTMLButtonElement).disabled = false;
+          }
+        });
+      }
+      addChatMessage(
+        `❌ 残念、違います。\n\nあと${
+          maxAttempts - quizState.attempts
+        }回挑戦できます。もう一度考えてみてください！`,
+        "assistant"
+      );
       addLog(`クイズ不正解（試行${quizState.attempts}回目）`, "warning");
     } else {
       // No more attempts, show answer
-      const correctOption = quizState.currentQuiz.options[quizState.currentQuiz.correctAnswer];
-      addChatMessage(`❌ 残念、違います。\n\n正解は「${quizState.currentQuiz.correctAnswer + 1}. ${correctOption}」でした。\n\n次は頑張ってくださいね！`, "assistant");
+      const correctOption =
+        quizState.currentQuiz.options[quizState.currentQuiz.correctAnswer];
+      addChatMessage(
+        `❌ 残念、違います。\n\n正解は「${
+          quizState.currentQuiz.correctAnswer + 1
+        }. ${correctOption}」でした。\n\n次は頑張ってくださいね！`,
+        "assistant"
+      );
       addLog("クイズ不正解、正解を表示", "warning");
 
       // Exit quiz mode
@@ -787,6 +1755,67 @@ function addChatMessage(
   }
 }
 
+// Add quiz message with button options
+function addQuizMessage(question: string, options: string[]) {
+  const chatHistory = document.getElementById("kairu-chat-history");
+  if (!chatHistory) return;
+
+  // Remove ID from previous quiz message (keep the message visible)
+  const oldQuiz = document.getElementById("kairu-current-quiz");
+  if (oldQuiz) {
+    oldQuiz.removeAttribute("id");
+  }
+
+  const messageDiv = document.createElement("div");
+  messageDiv.className = "chat-message assistant quiz-message";
+  messageDiv.id = "kairu-current-quiz";
+
+  // Create quiz content
+  const questionDiv = document.createElement("div");
+  questionDiv.className = "quiz-question";
+  questionDiv.textContent = question;
+  messageDiv.appendChild(questionDiv);
+
+  // Create button container
+  const buttonsContainer = document.createElement("div");
+  buttonsContainer.className = "quiz-buttons";
+
+  // Check if this is a startup quiz (5 questions) or legacy quiz
+  const isStartupQuiz = quizState.quizQuestions.length > 0;
+
+  // Create buttons for each option
+  options.forEach((option, index) => {
+    const button = document.createElement("button");
+    button.className = "quiz-option-btn";
+    button.textContent = `${index + 1}. ${option}`;
+    button.dataset.optionIndex = String(index + 1);
+
+    button.addEventListener("click", async () => {
+      // Disable all buttons
+      const allButtons = buttonsContainer.querySelectorAll("button");
+      allButtons.forEach((btn) => {
+        (btn as HTMLButtonElement).disabled = true;
+      });
+
+      // Check answer - use different handler for startup quiz
+      if (isStartupQuiz) {
+        await checkStartupQuizAnswer(index);
+      } else {
+        await checkQuizAnswer(String(index + 1));
+      }
+    });
+
+    buttonsContainer.appendChild(button);
+  });
+
+  messageDiv.appendChild(buttonsContainer);
+  chatHistory.appendChild(messageDiv);
+  chatHistory.scrollTop = chatHistory.scrollHeight;
+
+  // Save to storage
+  saveChatHistory();
+}
+
 // Add system message (status update) - returns the element so it can be updated
 // Show status in the input panel
 function showStatus(message: string) {
@@ -806,6 +1835,13 @@ function hideStatus() {
 
 // Create Kairu UI
 async function createKairuUI() {
+  // Check if body exists
+  if (!document.body) {
+    console.log("[Kairu] Body not ready, waiting...");
+    setTimeout(createKairuUI, 100);
+    return;
+  }
+
   // Check if already exists
   if (document.getElementById(KAIRU_CONTAINER_ID)) {
     return;
@@ -815,6 +1851,9 @@ async function createKairuUI() {
   const container = document.createElement("div");
   container.id = KAIRU_CONTAINER_ID;
   container.innerHTML = `
+    <div id="kairu-quiz-bubble" style="display: none;">
+      <span>クイズを作成中...</span>
+    </div>
     <button id="kairu-character-wrapper" type="button">
       <div class="kairu-avatar-shadow"></div>
       <div id="kairu-character">
@@ -828,17 +1867,24 @@ async function createKairuUI() {
     <div id="kairu-input-panel" style="display: none;">
       <div class="kairu-panel-header">
         <span>Kairuくん</span>
-        <button id="kairu-reset-btn" title="会話をリセット">🗑️</button>
+        <div class="kairu-header-buttons">
+          <button id="kairu-scroll-bottom-btn" title="最新の会話に移動">↓</button>
+          <button id="kairu-reset-btn" title="会話をリセット">🗑️</button>
+          <button id="kairu-close-btn" title="拡張機能を終了">✕</button>
+        </div>
       </div>
       <div id="kairu-chat-history"></div>
       <div class="kairu-input-container">
         <textarea id="${KAIRU_INPUT_ID}" placeholder="やりたいことを入力してください..."></textarea>
         <button id="kairu-submit-btn">送信</button>
       </div>
-      <details id="kairu-debug-log">
+      <details id="kairu-debug-log" style="display: none;">
         <summary>実行ログ</summary>
         <div id="kairu-log-content"></div>
       </details>
+      <div id="kairu-next-quiz-timer" style="display: none;">
+        <span id="kairu-next-quiz-text">次のクイズまで: 計算中...</span>
+      </div>
       <div id="kairu-status">
         <p id="kairu-status-text"></p>
       </div>
@@ -860,6 +1906,35 @@ async function createKairuUI() {
 
     #${KAIRU_CONTAINER_ID} * {
       color-scheme: light !important;
+    }
+
+    #kairu-quiz-bubble {
+      position: absolute;
+      bottom: 70px;
+      right: 80px;
+      background: white;
+      border-radius: 12px;
+      padding: 8px 14px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.15);
+      font-size: 13px;
+      color: #333;
+      white-space: nowrap;
+      animation: bubblePulse 1.5s ease-in-out infinite;
+    }
+
+    #kairu-quiz-bubble::after {
+      content: '';
+      position: absolute;
+      bottom: -8px;
+      right: 20px;
+      border-width: 8px 8px 0 8px;
+      border-style: solid;
+      border-color: white transparent transparent transparent;
+    }
+
+    @keyframes bubblePulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.7; }
     }
 
     #kairu-character-wrapper {
@@ -1003,22 +2078,52 @@ async function createKairuUI() {
       align-items: center;
     }
 
-    #kairu-reset-btn {
-      background: none;
+    .kairu-header-buttons {
+      display: flex;
+      gap: 4px;
+    }
+
+    #kairu-reset-btn,
+    #kairu-scroll-bottom-btn,
+    #kairu-close-btn {
+      background: white;
       border: none;
-      font-size: 18px;
+      font-size: 14px;
       cursor: pointer;
-      padding: 4px 8px;
-      border-radius: 4px;
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      border-radius: 50%;
       transition: background 0.2s;
+      color: #666;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
 
-    #kairu-reset-btn:hover {
-      background: rgba(0, 0, 0, 0.05);
+    #kairu-scroll-bottom-btn {
+      font-weight: bold;
+      transform: translateY(-2px);
     }
 
-    #kairu-reset-btn:active {
-      background: rgba(0, 0, 0, 0.1);
+    #kairu-close-btn {
+      font-weight: bold;
+    }
+
+    #kairu-reset-btn:hover,
+    #kairu-scroll-bottom-btn:hover,
+    #kairu-close-btn:hover {
+      background: #f0f0f0;
+    }
+
+    #kairu-close-btn:hover {
+      color: #f44336;
+    }
+
+    #kairu-reset-btn:active,
+    #kairu-scroll-bottom-btn:active,
+    #kairu-close-btn:active {
+      background: #e0e0e0;
     }
 
     #kairu-chat-history {
@@ -1061,6 +2166,52 @@ async function createKairuUI() {
       border: 1px solid rgba(102, 126, 234, 0.2);
     }
 
+    .quiz-message {
+      max-width: 95% !important;
+    }
+
+    .quiz-question {
+      margin-bottom: 12px;
+      white-space: pre-wrap;
+    }
+
+    .quiz-buttons {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .quiz-option-btn {
+      padding: 12px 16px;
+      background: white;
+      border: 2px solid #43a5f5;
+      border-radius: 8px;
+      color: #1e88e5;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      text-align: left;
+      width: 100%;
+    }
+
+    .quiz-option-btn:hover:not(:disabled) {
+      background: #e3f2fd;
+      border-color: #1e88e5;
+      transform: translateY(-1px);
+      box-shadow: 0 2px 8px rgba(67, 165, 245, 0.2);
+    }
+
+    .quiz-option-btn:active:not(:disabled) {
+      transform: translateY(0);
+    }
+
+    .quiz-option-btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
     .kairu-input-container {
       display: flex;
       flex-direction: column;
@@ -1088,6 +2239,16 @@ async function createKairuUI() {
       border-color: #667eea;
       background: rgba(255, 255, 255, 0.7);
       color: #333 !important;
+    }
+
+    #${KAIRU_INPUT_ID}.quiz-disabled {
+      background: rgba(200, 200, 200, 0.5);
+      color: #999 !important;
+      cursor: not-allowed;
+    }
+
+    #${KAIRU_INPUT_ID}.quiz-disabled::placeholder {
+      color: #999;
     }
 
     #kairu-submit-btn {
@@ -1149,6 +2310,16 @@ async function createKairuUI() {
       line-height: 1.4;
     }
 
+    #kairu-next-quiz-timer {
+      margin-top: 8px;
+      padding: 8px 12px;
+      background: #e3f2fd;
+      border-radius: 6px;
+      font-size: 12px;
+      color: #1565c0;
+      text-align: center;
+    }
+
     .log-entry {
       padding: 4px 8px;
       margin: 2px 0;
@@ -1204,6 +2375,11 @@ async function createKairuUI() {
   await restoreLastQuizCount();
   await restoreVisitedSites();
   await restoreQuizState();
+  await restoreLastSessionEnd();
+  await restoreLastMessageSent();
+  await restoreDailyVisitedSites();
+  await restoreQuizShownToday();
+  await restoreDebugMode();
 
   // Record initial site visit
   await recordSiteVisit();
@@ -1219,6 +2395,23 @@ async function createKairuUI() {
   const resetBtn = document.getElementById(
     "kairu-reset-btn"
   ) as HTMLButtonElement;
+  const scrollBottomBtn = document.getElementById(
+    "kairu-scroll-bottom-btn"
+  ) as HTMLButtonElement;
+  const closeBtn = document.getElementById(
+    "kairu-close-btn"
+  ) as HTMLButtonElement;
+
+  // Scroll to bottom button click
+  scrollBottomBtn.addEventListener("click", () => {
+    const chatHistory = document.getElementById("kairu-chat-history");
+    if (chatHistory) {
+      chatHistory.scrollTo({
+        top: chatHistory.scrollHeight,
+        behavior: "smooth",
+      });
+    }
+  });
 
   // Reset button click
   resetBtn.addEventListener("click", async () => {
@@ -1245,6 +2438,9 @@ async function createKairuUI() {
         isQuizMode: false,
         currentQuiz: null,
         attempts: 0,
+        quizQuestions: [],
+        currentQuestionIndex: 0,
+        correctCount: 0,
       };
 
       console.log("[Kairu] クイズ状態をリセット:", quizState);
@@ -1256,6 +2452,52 @@ async function createKairuUI() {
 
       addLog("会話履歴と実行ログをリセットしました", "info");
       addLog(`クイズモード状態: ${quizState.isQuizMode}`, "success");
+    }
+  });
+
+  // Close button click - disable Kairu and save session end time
+  closeBtn.addEventListener("click", async () => {
+    console.log("[Kairu] 終了ボタンがクリックされました");
+
+    // Disable Kairu
+    kairuEnabled = false;
+
+    // Hide Kairu UI
+    container.style.display = "none";
+
+    // Save enabled state
+    await saveEnabledState(kairuEnabled);
+
+    // Save session end timestamp for quiz timing
+    await saveLastSessionEnd();
+
+    console.log("[Kairu] 拡張機能を終了しました");
+  });
+
+  // Input focus event - check if quiz should be shown
+  input.addEventListener("focus", async () => {
+    if (!kairuEnabled) return;
+    if (quizState.isQuizMode) return;
+    if (isGeneratingQuiz) return; // クイズ生成中はスキップ
+
+    if (shouldShowQuizOnFocus()) {
+      console.log("[Kairu] フォーカス時にクイズ条件を満たしています");
+
+      // Get API key and start quiz
+      try {
+        if (isExtensionContextValid()) {
+          const response = await chrome.runtime.sendMessage({
+            type: "GET_API_KEY",
+          });
+          const apiKey = response.apiKey;
+
+          if (apiKey) {
+            await startStartupQuizMode(apiKey);
+          }
+        }
+      } catch (error) {
+        console.error("[Kairu] クイズの開始に失敗:", error);
+      }
     }
   });
 
@@ -1341,9 +2583,15 @@ async function createKairuUI() {
 
     // Apply boundaries
     // Bottom: minimum 0, maximum (window height - container height)
-    newBottom = Math.max(0, Math.min(newBottom, window.innerHeight - containerHeight));
+    newBottom = Math.max(
+      0,
+      Math.min(newBottom, window.innerHeight - containerHeight)
+    );
     // Right: minimum 0, maximum (window width - container width)
-    newRight = Math.max(0, Math.min(newRight, window.innerWidth - containerWidth));
+    newRight = Math.max(
+      0,
+      Math.min(newRight, window.innerWidth - containerWidth)
+    );
 
     container.style.bottom = `${newBottom}px`;
     container.style.right = `${newRight}px`;
@@ -1428,9 +2676,12 @@ async function createKairuUI() {
       addLog(`現在のクイズモード状態: ${quizState.isQuizMode}`, "info");
 
       if (quizState.isQuizMode) {
-        // In quiz mode: only accept quiz answers (1-4)
-        addLog("クイズモード中です", "info");
-        await checkQuizAnswer(userInput);
+        // In quiz mode: buttons only, no text input
+        addLog("クイズモード中です - ボタンで回答してください", "info");
+        addChatMessage(
+          "クイズに回答中です。上のボタンをクリックして回答してください。",
+          "assistant"
+        );
         return;
       }
 
@@ -1471,19 +2722,28 @@ async function createKairuUI() {
       // Save conversation to storage
       saveConversation();
 
+      // Save last message sent timestamp for quiz timing
+      await saveLastMessageSent();
+
       // Parse response and execute actions
       await processAIResponse(aiResponse);
 
+      // Re-enable button after AI response is processed
+      // (allows user to send messages while quiz is being generated)
+      submitBtn.disabled = false;
+      submitBtn.textContent = "送信";
+      character.classList.remove("loading");
+
       // Check if it's time to show a quiz
-      addLog(`クイズ判定: メッセージ数=${messageCount}, 前回クイズ=${lastQuizCount}, 訪問サイト数=${visitedSites.length}, クイズモード=${quizState.isQuizMode}`, "info");
+      addLog(
+        `クイズ判定: メッセージ数=${messageCount}, 前回クイズ=${lastQuizCount}, 訪問サイト数=${visitedSites.length}, クイズモード=${quizState.isQuizMode}`,
+        "info"
+      );
 
       if (shouldShowQuiz()) {
         addLog("クイズ出題条件を満たしました", "success");
         // Wait a bit before showing quiz
         await new Promise((resolve) => setTimeout(resolve, 1000));
-
-        // Update button state for quiz generation (keep disabled but change text)
-        submitBtn.textContent = "送信";
 
         await startQuizMode(apiKey);
       } else {
@@ -1514,7 +2774,7 @@ async function createKairuUI() {
       addLog(errorMsg, "error");
       addChatMessage(errorMsg, "assistant");
     } finally {
-      // Stop loading animation
+      // Ensure button is re-enabled and animation is stopped in case of error
       character.classList.remove("loading");
       submitBtn.disabled = false;
       submitBtn.textContent = "送信";
@@ -1531,6 +2791,37 @@ async function createKairuUI() {
 }
 
 // Get page HTML structure
+// Get page text content (for understanding page context)
+function getPageTextContent(): string {
+  // Get body clone, excluding Kairu UI
+  const bodyClone = document.body.cloneNode(true) as HTMLElement;
+
+  // Remove Kairu UI
+  const kairuContainer = bodyClone.querySelector(`#${KAIRU_CONTAINER_ID}`);
+  if (kairuContainer) {
+    kairuContainer.remove();
+  }
+
+  // Remove script tags, style tags, and other non-content elements
+  bodyClone
+    .querySelectorAll("script, style, noscript, svg, path, iframe")
+    .forEach((el) => el.remove());
+
+  // Get text content only
+  let text = bodyClone.textContent || "";
+
+  // Clean up excessive whitespace
+  text = text.replace(/\s+/g, " ").trim();
+
+  // Limit to reasonable size (first 10000 characters)
+  if (text.length > 10000) {
+    text =
+      text.substring(0, 10000) + "\n... (テキストが長すぎるため省略されました)";
+  }
+
+  return text;
+}
+
 function getPageHTML(): string {
   // Get body HTML, excluding Kairu UI
   const bodyClone = document.body.cloneNode(true) as HTMLElement;
@@ -1590,12 +2881,15 @@ function getPageElements(): string {
       const name = el.getAttribute("name") || "";
       const id = el.getAttribute("id") || "";
       const placeholder = el.getAttribute("placeholder") || "";
-      const value = (el as HTMLInputElement).value?.substring(0, 50) || ""; // Increased from 20 to 50
+      const ariaLabel = el.getAttribute("aria-label") || "";
+      const value = (el as HTMLInputElement).value?.substring(0, 50) || "";
       return `${i + 1}. <${tag}${type !== "text" ? ` type="${type}"` : ""}${
         name ? ` name="${name}"` : ""
       }${id ? ` id="${id}"` : ""}${
         placeholder ? ` placeholder="${placeholder}"` : ""
-      }${value ? ` value="${value}"` : ""}>`;
+      }${ariaLabel ? ` aria-label="${ariaLabel}"` : ""}${
+        value ? ` value="${value}"` : ""
+      }>`;
     })
     .join("\n");
 
@@ -1603,14 +2897,18 @@ function getPageElements(): string {
     .filter((el) => !el.closest(`#${KAIRU_CONTAINER_ID}`) && isVisible(el))
     .map((el, i) => {
       const tag = el.tagName.toLowerCase();
-      const text = el.textContent?.trim().substring(0, 80) || ""; // Increased from 30 to 80
+      const text = el.textContent?.trim().substring(0, 80) || "";
       const id = el.getAttribute("id") || "";
+      const name = el.getAttribute("name") || "";
       const className = el.getAttribute("class")?.split(" ")[0] || "";
       const role = el.getAttribute("role") || "";
       const href = el.getAttribute("href") || "";
+      const ariaLabel = el.getAttribute("aria-label") || "";
       return `${i + 1}. <${tag}${id ? ` id="${id}"` : ""}${
-        className ? ` class="${className}"` : ""
-      }${role ? ` role="${role}"` : ""}${
+        name ? ` name="${name}"` : ""
+      }${className ? ` class="${className}"` : ""}${
+        role ? ` role="${role}"` : ""
+      }${ariaLabel ? ` aria-label="${ariaLabel}"` : ""}${
         href ? ` href="${href.substring(0, 50)}"` : ""
       }> "${text}"`;
     })
@@ -1633,35 +2931,43 @@ async function callOpenAI(
   showStatus("📦 ページ情報を収集中...");
 
   // Collect page information
+  addLog("ページテキストを取得中...", "info");
+  const pageText = getPageTextContent();
+  addRawLog("ページテキスト", pageText);
+
   addLog("インタラクティブ要素を取得中...", "info");
   const pageElements = getPageElements();
   addRawLog("検出されたページ要素", pageElements);
-
-  addLog("ページHTML構造を取得中...", "info");
-  const pageHTML = getPageHTML();
-  addRawLog("送信するHTML構造", pageHTML);
 
   const pageContext = `
 現在のページ情報:
 - URL: ${window.location.href}
 - タイトル: ${document.title}
 
-## インタラクティブ要素（重要）
+## ページ内容（テキストのみ）
+${pageText}
+
+## インタラクティブ要素リスト
 以下は、クリックや入力が可能な主要な要素のリストです。
+このリストから要素を選択して操作してください。
 
 ${pageElements}
 
-## ページのHTML構造
-ページ全体のHTML構造です。正確なセレクタを作成するために使用してください。
-
-${pageHTML}
+注意: リストに無い要素を操作する必要がある場合のみ、textパラメータを使用してください。
 `;
 
   showStatus("🐬💭 Kairuくんが処理を考えています...");
 
   const systemPrompt = `あなたはKairuというブラウザ操作アシスタントです。ユーザーの指示に従ってブラウザを操作します。
 
-## 🚨 最重要ルール：インタラクティブ要素リストを必ず使用すること
+## 🚨 ユーザーへの応答ルール
+- 「インタラクティブ要素リスト」「セレクタ」「selector」「要素」などの技術的な用語をユーザーに見せないでください
+- ユーザーには操作の結果や次に何をするかをシンプルに伝えてください
+- 内部的な仕組みや技術的な詳細は一切言及しないでください
+- 「候補を提案します」「要素を選んでください」のような内部処理をユーザーに委ねるメッセージは禁止です
+- できない操作がある場合は「〜が見つかりませんでした」とだけ伝えてください
+
+## 🚨 最重要ルール：インタラクティブ要素リストを必ず使用すること（内部処理用）
 
 **要素をクリックする際の手順（必須）:**
 1. まず「インタラクティブ要素」セクションで該当する要素を探す
@@ -1794,7 +3100,8 @@ ${pageHTML}
 
         // Handle rate limit error
         if (error.code === "rate_limit_exceeded") {
-          const message = "⏱️ APIのレート制限に達しました。少し時間をおいてから再度お試しください。";
+          const message =
+            "⏱️ APIのレート制限に達しました。少し時間をおいてから再度お試しください。";
           addChatMessage(message, "assistant");
           throw new Error(message);
         }
@@ -1807,7 +3114,9 @@ ${pageHTML}
     } catch (parseError) {
       // If error response is not JSON, use the raw text
       if (parseError instanceof SyntaxError) {
-        throw new Error(`API request failed: ${response.status} - ${errorText}`);
+        throw new Error(
+          `API request failed: ${response.status} - ${errorText}`
+        );
       }
       throw parseError;
     }
@@ -1869,45 +3178,33 @@ async function processAIResponse(aiResponse: string): Promise<void> {
 async function executeAction(action: any): Promise<void> {
   console.log("Executing action:", action);
 
-  // Enable AI operation mode to allow interactions
-  isAIOperating = true;
-  addLog("AI操作モード: ON", "info");
-
-  try {
-    switch (action.action) {
-      case "click":
-        await clickElement(action.selector, action.text);
-        break;
-      case "type":
-        await typeInElement(action.selector, action.value);
-        break;
-      case "navigate":
-        window.location.href = action.url;
-        break;
-      case "scroll":
-        scrollPage(action.direction);
-        break;
-      case "back":
-        addLog("ブラウザで戻る操作を実行", "info");
-        window.history.back();
-        break;
-      case "forward":
-        addLog("ブラウザで進む操作を実行", "info");
-        window.history.forward();
-        break;
-      case "get_info":
-        const info = getPageInfo(action.type);
-        console.log("Page info:", info);
-        break;
-      default:
-        console.warn("Unknown action:", action.action);
-    }
-  } finally {
-    // Disable AI operation mode after a short delay
-    setTimeout(() => {
-      isAIOperating = false;
-      addLog("AI操作モード: OFF", "info");
-    }, 100);
+  switch (action.action) {
+    case "click":
+      await clickElement(action.selector, action.text);
+      break;
+    case "type":
+      await typeInElement(action.selector, action.value);
+      break;
+    case "navigate":
+      window.location.href = action.url;
+      break;
+    case "scroll":
+      scrollPage(action.direction);
+      break;
+    case "back":
+      addLog("ブラウザで戻る操作を実行", "info");
+      window.history.back();
+      break;
+    case "forward":
+      addLog("ブラウザで進む操作を実行", "info");
+      window.history.forward();
+      break;
+    case "get_info":
+      const info = getPageInfo(action.type);
+      console.log("Page info:", info);
+      break;
+    default:
+      console.warn("Unknown action:", action.action);
   }
 }
 
@@ -1943,7 +3240,10 @@ async function clickElement(selector?: string, text?: string): Promise<void> {
     if (!element) {
       for (const el of Array.from(allElements)) {
         const elementText = el.textContent?.toLowerCase().trim() || "";
-        if (elementText.includes(normalizedText) || normalizedText.includes(elementText)) {
+        if (
+          elementText.includes(normalizedText) ||
+          normalizedText.includes(elementText)
+        ) {
           element = el as HTMLElement;
           addLog("部分一致で要素を発見", "success");
           break;
@@ -1959,8 +3259,10 @@ async function clickElement(selector?: string, text?: string): Promise<void> {
         const linkText = link.textContent?.toLowerCase().trim() || "";
 
         // Check if text matches href or link text
-        if (href.toLowerCase().includes(normalizedText) ||
-            linkText.includes(normalizedText)) {
+        if (
+          href.toLowerCase().includes(normalizedText) ||
+          linkText.includes(normalizedText)
+        ) {
           element = link as HTMLElement;
           addLog("リンクのhrefまたはテキストで要素を発見", "success");
           break;
@@ -1982,7 +3284,7 @@ async function clickElement(selector?: string, text?: string): Promise<void> {
     // List available links for debugging
     const availableLinks = Array.from(document.querySelectorAll("a"))
       .slice(0, 10)
-      .map(link => link.textContent?.trim().substring(0, 50))
+      .map((link) => link.textContent?.trim().substring(0, 50))
       .filter(Boolean);
 
     const searchCriteria = selector
@@ -1990,7 +3292,10 @@ async function clickElement(selector?: string, text?: string): Promise<void> {
       : `text: ${text}`;
     const errorMsg = `要素が見つかりませんでした (${searchCriteria})`;
     addLog(errorMsg, "error");
-    addLog(`利用可能なリンク（最初の10件）: ${availableLinks.join(", ")}`, "info");
+    addLog(
+      `利用可能なリンク（最初の10件）: ${availableLinks.join(", ")}`,
+      "info"
+    );
     throw new Error(errorMsg);
   }
 }
@@ -2058,44 +3363,21 @@ chrome.runtime.onMessage.addListener((request, _sender, sendResponse) => {
       container.style.display = kairuEnabled ? "block" : "none";
     }
 
-    // Block/unblock page scroll
-    if (kairuEnabled) {
-      document.body.style.overflow = "hidden";
-    } else {
-      document.body.style.overflow = "";
-    }
-
     // Save enabled state to storage
     saveEnabledState(kairuEnabled);
+
+    sendResponse({ success: true });
+  } else if (request.type === "SET_DEBUG_MODE") {
+    debugMode = request.enabled;
+    console.log("Debug mode:", debugMode ? "enabled" : "disabled");
+
+    // Update debug UI visibility
+    updateDebugUIVisibility();
 
     sendResponse({ success: true });
   }
   return true;
 });
-
-// Block all page interactions except Kairu UI
-function blockPageInteractions(e: Event) {
-  // Don't block if Kairu is disabled
-  if (!kairuEnabled) {
-    return;
-  }
-
-  const target = e.target as HTMLElement;
-
-  // Allow interactions with Kairu UI
-  if (target.closest(`#${KAIRU_CONTAINER_ID}`)) {
-    return;
-  }
-
-  // Allow AI operations
-  if (isAIOperating) {
-    return;
-  }
-
-  // Block everything else
-  e.preventDefault();
-  e.stopPropagation();
-}
 
 // Initialize when page is fully loaded (including JS-generated content)
 if (document.readyState === "complete") {
@@ -2109,16 +3391,44 @@ if (document.readyState === "complete") {
   });
 }
 
-// Block all interactions
-const events = [
-  "click",
-  "mousedown",
-  "mouseup",
-  "keydown",
-  "keypress",
-  "keyup",
-  "submit",
-];
-events.forEach((eventType) => {
-  document.addEventListener(eventType, blockPageInteractions, true);
+// ========================================
+// URL変更の監視（SPA対応）
+// ========================================
+let lastRecordedUrl = window.location.href;
+
+// URL変更時に呼ばれる共通処理
+async function onUrlChange() {
+  const currentUrl = window.location.href;
+  if (currentUrl !== lastRecordedUrl) {
+    lastRecordedUrl = currentUrl;
+    console.log("[Kairu] URL changed:", currentUrl);
+    // 少し待ってからページ内容を取得（SPAのコンテンツ読み込み待ち）
+    setTimeout(async () => {
+      await recordSiteVisit();
+    }, 500);
+  }
+}
+
+// History API (pushState/replaceState) をフック
+const originalPushState = history.pushState.bind(history);
+const originalReplaceState = history.replaceState.bind(history);
+
+history.pushState = function (...args) {
+  originalPushState(...args);
+  onUrlChange();
+};
+
+history.replaceState = function (...args) {
+  originalReplaceState(...args);
+  onUrlChange();
+};
+
+// popstate イベント（ブラウザの戻る/進む）
+window.addEventListener("popstate", () => {
+  onUrlChange();
+});
+
+// hashchange イベント（ハッシュ変更）
+window.addEventListener("hashchange", () => {
+  onUrlChange();
 });

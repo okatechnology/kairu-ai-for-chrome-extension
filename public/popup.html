@@ -63,6 +63,32 @@
       color: #28a745;
       min-height: 16px;
     }
+    #secretArea {
+      height: 30px;
+      cursor: default;
+      user-select: none;
+    }
+    #debugSection {
+      display: none;
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px dashed #ccc;
+    }
+    #debugSection.visible {
+      display: block;
+    }
+    .debug-checkbox {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      color: #666;
+      cursor: pointer;
+    }
+    .debug-checkbox input {
+      width: auto;
+      margin: 0;
+    }
   </style>
 </head>
 <body>
@@ -77,6 +103,15 @@
   <button id="toggleKairu">Kairuを有効化</button>
 
   <div id="status"></div>
+
+  <div id="secretArea"></div>
+
+  <div id="debugSection">
+    <label class="debug-checkbox">
+      <input type="checkbox" id="debugMode">
+      デバッグモード
+    </label>
+  </div>
 
   <script src="popup.js"></script>
 </body>
